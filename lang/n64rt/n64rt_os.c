@@ -731,337 +731,64 @@ static int emulate_hw_at(n64rt_ctx_t *x, u32 insn, u32 op, u32 rt, u32 badv)
 }
 
 /* ---- the TLB --------------------------------------------------------------------
- * A game's osMapTLB is kept in a table here: its 32 entries, pairs of pages
- * of any size.
+ * The CPU's: mips_core's real TLB (COP0 register 23 reads 'T' 'L' 'B' and bit 1 set). A game's tlbwi, tlbwr, tlbr and tlbp are
+ * executed by it, a page no entry maps (or an invalid one, or a store to a clean one) is the exception the VR4300 raises, and the
+ * game's own handler runs -- nothing of this is the runtime's: it keeps no table of the game's entries, patches none of libultra's
+ * functions, and needs no table of games. A mapped page costs a micro-TLB fill (some cycles) and no exception when an entry names it.
  *
- * On the CPU with translation tables (mips_core's TLB_RAM: found at the
- * start by its COP0 register 23) an access to, or a fetch from, a page with
- * no entry there takes the TLB's exception, and tlb_fill() writes the entry
- * of that 4 KiB from the game's -- into the data table or the fetch table,
- * as the CPU says the exception was -- and the instruction runs again. A page
- * costs one exception, whatever is done with it afterwards, and code runs
- * from a mapped page. The tables are emptied whenever the game maps or
- * unmaps (the entries come back as they are used).
- *
- * The CPU without them has no TLB: an access to a mapped page traps (an
- * address error: nothing is there) and is done on the game's behalf -- the
- * load or store is decoded, run on the RDRAM the page maps, and the game goes
- * on past it, through the branch when it was in a delay slot. That is
- * thousands of times an access's cost, so it is for what a game maps briefly:
- * Super Mario 64 maps its title screen's head (a segment linked at
- * 0x04000000) while it builds it, and unmaps it. Code cannot run from a
- * mapped page there. */
-#define TLB_N 32
-struct n64rt_tlbs_e { u32 va, span, pa[2]; s32 asid; };           /* (20 bytes: n64rt_exc.S's tlbwi reads `span`, at +4) */
-struct n64rt_tlbs_e n64rt_tlbs[TLB_N];                           /* a pair of pages of `span` bytes; span 0: free */
-#define s_tlb n64rt_tlbs
-_Static_assert(sizeof(struct n64rt_tlbs_e) == 20 && __builtin_offsetof(struct n64rt_tlbs_e, span) == 4, "n64rt_exc.S's tlbwi");
-static u32 s_tlb_n, s_tlb_hits, s_tlb_fills, s_tlb_delivered;
-u32 n64rt_tlbram;                       /* the CPU has the translation tables */
-/* The bits of COP0 23's write value (bit 4 is the page of the pair; the physical page is bits 28:12): valid, dirty (writable), global,
- * the fetch table, and TR_C = the page is CACHEABLE (the entry's C field, EntryLo bits 5:3, is not 2 = uncached). mips_core's fetch
- * table keeps the bit (the fetch page registers use the I-cache for a cacheable mapped page); the data tables have no field for it
- * yet and a mapped data access is uncached, a word at a time. */
-enum { TR_V = 1, TR_D = 2, TR_G = 4, TR_FETCH = 8, TR_C = 32 };
-/* an entry of the CPU's tables: COP0 23 stores it for EntryHi's page pair
- * and ASID -- the physical page, which page of the pair (va's bit 12), the
- * table, global / dirty / valid */
-static inline void tr_write(u32 va, u32 pa, u32 flags)
-{
-    __asm__ volatile("mtc0 %0, $23" : : "r"((pa & 0x1FFFF000u) | ((va >> 8) & 16u) | flags));
-}
-/* both tables emptied (EntryHi names each page pair in turn: the game's ASID
- * is put back; interrupts off, a thread's TLB exception uses EntryHi too) */
-static void tr_flush(void)
-{
-    if (!n64rt_tlbram) return;
-    u32 m = ints_off(), hi;
-    __asm__ volatile("mfc0 %0, $10" : "=r"(hi));
-    for (u32 va = 0; va < 512u << 12; va += 0x1000u) {
-        if (!(va & 0x1000u)) __asm__ volatile("mtc0 %0, $10" : : "r"(va));
-        tr_write(va, 0, 0); tr_write(va, 0, TR_FETCH);
-    }
-    __asm__ volatile("mtc0 %0, $10" : : "r"(hi));
-    ints_on(m);
-}
-/* the pages of [va, va + bytes) emptied in both tables (a big range: all of them) */
-static void tr_inval(u32 va, u32 bytes)
-{
-    if (!n64rt_tlbram) return;
-    if (bytes > 0x40000u) { tr_flush(); return; }
-    u32 m = ints_off(), hi;
-    __asm__ volatile("mfc0 %0, $10" : "=r"(hi));
-    for (u32 a = va & ~0x1FFFu; a < va + bytes; a += 0x2000u) {
-        __asm__ volatile("mtc0 %0, $10" : : "r"(a));
-        tr_write(a, 0, 0); tr_write(a, 0, TR_FETCH);
-        tr_write(a + 0x1000u, 0, 0); tr_write(a + 0x1000u, 0, TR_FETCH);
-    }
-    __asm__ volatile("mtc0 %0, $10" : : "r"(hi));
-    ints_on(m);
-}
-/* the page of the TLB exception's address, from the game's entries: 1 when filled */
-static int tlb_fill(void)
-{
-    u32 badv, sel, hi;                                  /* (EntryHi: the faulting page pair, the game's ASID) */
-    __asm__ volatile("mfc0 %0, $8" : "=r"(badv));
-    __asm__ volatile("mfc0 %0, $23" : "=r"(sel));
-    __asm__ volatile("mfc0 %0, $10" : "=r"(hi));
-    for (int i = 0; i < TLB_N; i++) {
-        u32 span = s_tlb[i].span, off = badv - s_tlb[i].va;
-        if (!span || off >= 2u * span) continue;
-        if (s_tlb[i].asid >= 0 && (u32)s_tlb[i].asid != (hi & 0xFFu)) continue;
-        u32 p = s_tlb[i].pa[off >= span];
-        if (p == 0xFFFFFFFFu) return 0;
-        p += off & (span - 1u) & ~0xFFFu;
-        if (p >= 0x00800000u) return 0;                     /* (the RDRAM) */
-        tr_write(badv, p, TR_V | TR_D | TR_C | (s_tlb[i].asid < 0 ? TR_G : 0) | (sel & TR_FETCH));      /* (osMapTLB maps cached pages) */
-        s_tlb_fills++;
-        return 1;
-    }
-    return 0;
-}
-void n64rt_osMapTLB(s32 index, u32 pm, u32 vaddr, u32 even, u32 odd, s32 asid)
-{
-    if ((u32)index >= TLB_N) return;
-    u32 span = (pm + 0x2000u) >> 1;                       /* OS_PM_4K 0 .. OS_PM_16M 0x1FFE000 */
-    if (!s_tlb[index].span) s_tlb_n++;
-    tr_flush();
-    s_tlb[index].asid = asid;
-    s_tlb[index].va = vaddr & ~(2u * span - 1u);
-    s_tlb[index].span = span;
-    s_tlb[index].pa[0] = even == 0xFFFFFFFFu ? even : even & ~(span - 1u);
-    s_tlb[index].pa[1] = odd == 0xFFFFFFFFu ? odd : odd & ~(span - 1u);
-    if (s_tlb_n == 1u && !s_tlb_hits)
-        n64rt_log("n64rt: osMapTLB(%ld): %08lx, two pages of %lu KiB at %08lx and %08lx (%s)\n", (long)index,
-                  (unsigned long)s_tlb[index].va, (unsigned long)(span >> 10), (unsigned long)even, (unsigned long)odd,
-                  n64rt_tlbram ? "the CPU's tables" : "done in software");
-}
-void n64rt_osUnmapTLB(s32 index)
-{
-    if ((u32)index < TLB_N && s_tlb[index].span) { s_tlb[index].span = 0; s_tlb_n--; tr_flush(); }
-}
-void n64rt_osUnmapTLBAll(void)
-{
-    if (s_tlb_n && (s_tlb_hits || s_tlb_fills)) {
-        n64rt_log("n64rt: osUnmapTLBAll: %lu accesses to mapped pages were done in software, %lu pages entered in the CPU's tables\n",
-                  (unsigned long)s_tlb_hits, (unsigned long)s_tlb_fills);
-        s_tlb_hits = s_tlb_fills = 0;
-    }
-    if (s_tlb_n) tr_flush();
-    for (int i = 0; i < TLB_N; i++) s_tlb[i].span = 0;
-    s_tlb_n = 0;
-}
-/* ---- the game's own TLB instructions (OWN) ---------------------------------------
- * A core with the translation tables and the monitor (mips_core TLB_RAM + MON; COP0 register 23's bit 0) takes the game's
- * tlbwi, tlbwr, tlbr and tlbp as a Reserved Instruction for the monitor level (code 10, EPC the instruction): the game's
- * own osMapTLB, osUnmapTLB, osUnmapTLBAll, __osProbeTLB and osVirtualToPhysical then run as they are, wherever they are in
- * the game's memory (a segment it unpacks or loads later too), and nothing of the game has to be found or patched.
- * The 32 entries are kept here as the registers gave them (s_tlbr, which tlbr and tlbp work on) and as the table the
- * fill reads (s_tlb, from osMapTLB's days: a pair of pages of any size by the physical addresses).
- * Done as the VR4300 does, on its registers (the monitor level reads and writes the game's COP0 ones):
- *   tlbwi  entry Index & 31 := PageMask, EntryHi (VPN2 and ASID), EntryLo0, EntryLo1
- *   tlbwr  the same at Random (which runs from 31 down to Wired)
- *   tlbr   PageMask, EntryHi, EntryLo0, EntryLo1 := entry Index & 31 (G in both EntryLo: the two entries' AND)
- *   tlbp   Index := the entry EntryHi names (VPN2 under the entry's mask, ASID unless global), or P (bit 31) if none
- * The D bit (a store to a clean page is a Mod exception for the game's handler), V, G and the ASID are honoured (tlb_service); C is
- * passed on to the tables as TR_C (they do not keep it yet). A tlbr, tlbp or tlbwi that changes no translation is done in
- * n64rt_exc.S without the full path's register save (n64rt_mon_tlbq). */
-u32 n64rt_tlbi;                         /* the core takes the game's TLB instructions (COP0 23 bit 0) */
-#ifdef N64RT_OWN
-struct n64rt_tlbr_e { u32 mask, hi, lo0, lo1; };                 /* (16 bytes: n64rt_exc.S's tlbr, tlbp and tlbwi work on them) */
-struct n64rt_tlbr_e n64rt_tlbr[TLB_N];                           /* (hi ^ 0x80000000: a free entry names KSEG0, which no TLB access has) */
-#define s_tlbr n64rt_tlbr
-_Static_assert(sizeof(struct n64rt_tlbr_e) == 16, "n64rt_exc.S's tlbr, tlbp and tlbwi");
-#define CP0_GET(reg, v) __asm__ volatile("mfc0 %0, $" #reg : "=r"(v))
-#define CP0_SET(reg, v) __asm__ volatile("mtc0 %0, $" #reg : : "r"(v))
-static void tlb_write(u32 i)
-{
-    u32 mask, hi, lo0, lo1;
-    CP0_GET(5, mask); CP0_GET(10, hi); CP0_GET(2, lo0); CP0_GET(3, lo1);
-    mask &= 0x01FFE000u; hi &= ~(mask | 0x1F00u); lo0 &= 0x3FFFFFFFu; lo1 &= 0x3FFFFFFFu;
-    s_tlbr[i].mask = mask; s_tlbr[i].hi = hi ^ 0x80000000u; s_tlbr[i].lo0 = lo0; s_tlbr[i].lo1 = lo1;
-    const u32 span = (mask + 0x2000u) >> 1;                            /* a page of the pair (4 KiB with no mask) */
-    const u32 p0 = lo0 & 2u ? ((lo0 >> 6) << 12) & ~(span - 1u) : 0xFFFFFFFFu;     /* (V clear: nothing is mapped) */
-    const u32 p1 = lo1 & 2u ? ((lo1 >> 6) << 12) & ~(span - 1u) : 0xFFFFFFFFu;
-    const int was = s_tlb[i].span != 0, on = p0 != 0xFFFFFFFFu || p1 != 0xFFFFFFFFu;
-    if (was) tr_inval(s_tlb[i].va, 2u * s_tlb[i].span);              /* (what the CPU's tables took from this entry goes) */
-    s_tlb_n += (u32)on - (u32)was;
-    s_tlb[i].span = on ? span : 0;
-    s_tlb[i].asid = (lo0 & lo1 & 1u) ? -1 : (s32)(hi & 0xFFu);
-    s_tlb[i].va = hi & 0xFFFFE000u & ~(2u * span - 1u);
-    s_tlb[i].pa[0] = p0; s_tlb[i].pa[1] = p1;
-    if (on && s_tlb_n == 1u && !s_tlb_hits && !s_tlb_fills)
-        n64rt_log("n64rt: the game maps %08lx, two pages of %lu KiB at %08lx and %08lx (its own TLB instruction; entry %lu)\n",
-                  (unsigned long)s_tlb[i].va, (unsigned long)(span >> 10), (unsigned long)p0, (unsigned long)p1, (unsigned long)i);
-}
-static void tlb_read(u32 i)
-{
-    const u32 g = s_tlbr[i].lo0 & s_tlbr[i].lo1 & 1u;
-    CP0_SET(5, s_tlbr[i].mask);
-    CP0_SET(10, s_tlbr[i].hi ^ 0x80000000u);
-    CP0_SET(2, (s_tlbr[i].lo0 & ~1u) | g);
-    CP0_SET(3, (s_tlbr[i].lo1 & ~1u) | g);
-}
-static void tlb_probe(void)
-{
-    u32 hi, found = 0x80000000u;
-    CP0_GET(10, hi);
-    for (u32 i = 0; i < TLB_N; i++) {
-        const u32 ehi = s_tlbr[i].hi ^ 0x80000000u, vpn = ~(s_tlbr[i].mask | 0x1FFFu);
-        if ((hi & vpn) == (ehi & vpn) && ((s_tlbr[i].lo0 & s_tlbr[i].lo1 & 1u) || (hi & 0xFFu) == (ehi & 0xFFu))) { found = i; break; }
-    }
-    CP0_SET(0, found);                  /* (the core lets the monitor level write Index's P bit) */
-}
-/* the game's TLB instruction at x->epc (or in the delay slot behind it): 1 when it was done */
-static int tlb_insn(n64rt_ctx_t *x, int bd)
-{
-    u32 pc = x->epc + (bd ? 4u : 0u), next = pc + 4u, insn, v;
-    if (!insn_at(pc, &insn)) return 0;                                 /* (KSEG0, or a page the game mapped) */
-    if ((insn & 0xFFFFFFC0u) != 0x42000000u) return 0;
-#ifdef N64RT_DEBUG
-    {   /* (the first of each kind, and every 4096th) */
-        static u32 s_n[64];
-        u32 k = insn & 63u, e0, e1, hi, pm, ix;
-        if (s_n[k]++ < 4u || (s_n[k] & 4095u) == 0u) {
-            CP0_GET(0, ix); CP0_GET(2, e0); CP0_GET(3, e1); CP0_GET(5, pm); CP0_GET(10, hi);
-            n64rt_log("n64rt: the game's %s at %08lx (#%lu): Index %08lx EntryHi %08lx EntryLo %08lx %08lx PageMask %08lx\n",
-                      k == 1 ? "tlbr" : k == 2 ? "tlbwi" : k == 6 ? "tlbwr" : "tlbp", (unsigned long)pc, (unsigned long)s_n[k],
-                      (unsigned long)ix, (unsigned long)hi, (unsigned long)e0, (unsigned long)e1, (unsigned long)pm);
-        }
-    }
-#endif
-    switch (insn & 63u) {
-    case 0x01: CP0_GET(0, v); tlb_read(v & 31u); break;                                   /* tlbr */
-    case 0x02: CP0_GET(0, v); if ((v & 63u) < TLB_N) tlb_write(v & 63u); break;           /* tlbwi */
-    case 0x06: CP0_GET(1, v); tlb_write(v & 31u); break;                                  /* tlbwr */
-    case 0x08: tlb_probe(); break;                                                        /* tlbp */
-    default: return 0;
-    }
-    if (bd && !branch_next(x, x->epc, &next)) return 0;
-    x->epc = next;
-    return 1;
-}
-/* ---- a TLB exception the game's own handler takes ----------------------------------------------------------
- * The CPU's tables hold what the game's entries map, one 4 KiB page at a time, filled when an access misses
- * (tlb_service). What the entries do not map is the game's to handle, as on the VR4300 -- GoldenEye's code and data
- * at 0x7F000000 are pages its own refill handler maps on demand (tlbwr from a table of its own):
- *   no entry names the page           TLBL (load, fetch) or TLBS (store), the refill vector
- *   an entry names it, V clear        the same code, the general vector
- *   a store to a page with D clear    Mod (code 1), the general vector
- * The refill vector is 0x8000_0000 when the game's EXL is clear and 0x8000_0180 when it is set; the general vector is
- * 0x8000_0180. The monitor does what the CPU does for an exception it takes itself -- EPC (the branch's, with BD, in
- * a delay slot; not changed when EXL was set), Cause.ExcCode, BadVAddr and EntryHi (set by the CPU when the
- * exception came to the monitor), Context's BadVPN2, Status.EXL -- and returns to the vector. The game's handler does its
- * tlbwr (tlb_insn), eret, and the instruction runs again: the access misses the tables, and tlb_service fills the page
- * from the entry the handler wrote. Cause.ExcCode / BD and Context's BadVPN2 are written by mtc0 in the monitor
- * level only (mips_core, MON). */
-enum { TLBX_FILLED, TLBX_REFILL, TLBX_INVALID, TLBX_MOD, TLBX_NONE };
-static int tlb_service(u32 code)
-{
-    u32 badv, sel, hi;
-    CP0_GET(8, badv); CP0_GET(23, sel); CP0_GET(10, hi);
-    for (u32 i = 0; i < TLB_N; i++) {
-        const u32 ehi = s_tlbr[i].hi ^ 0x80000000u, vpn = ~(s_tlbr[i].mask | 0x1FFFu);
-        const u32 g = s_tlbr[i].lo0 & s_tlbr[i].lo1 & 1u;
-        if ((badv & vpn) != (ehi & vpn) || (!g && (hi & 0xFFu) != (ehi & 0xFFu))) continue;
-        const u32 span = (s_tlbr[i].mask + 0x2000u) >> 1, off = badv - (ehi & 0xFFFFE000u & ~(2u * span - 1u));
-        const u32 lo = off >= span ? s_tlbr[i].lo1 : s_tlbr[i].lo0;
-        if (!(lo & 2u)) return TLBX_INVALID;
-        if (code == 1u && !(lo & 4u)) return TLBX_MOD;
-        const u32 pa = ((((lo >> 6) << 12) & ~(span - 1u)) + (off & (span - 1u) & ~0xFFFu));
-        if (pa >= 0x00800000u) return TLBX_NONE;                                   /* (not the RDRAM) */
-        tr_write(badv, pa, TR_V | ((lo & 4u) ? TR_D : 0u) | (g ? TR_G : 0u) | (((lo >> 3) & 7u) != 2u ? TR_C : 0u) | (sel & TR_FETCH));
-        s_tlb_fills++;
-#ifdef N64RT_DEBUG
-        { static u32 s_n; if (s_n++ < 600u) n64rt_log("n64rt: TLB page %08lx -> %08lx (entry %lu, %s%s)\n", (unsigned long)(badv & ~0xFFFu), (unsigned long)pa, (unsigned long)i,
-                                                       (sel & TR_FETCH) ? "fetch" : "data", (lo & 4u) ? "" : ", clean"); }
-#endif
-        return TLBX_FILLED;
-    }
-    return TLBX_REFILL;
-}
-static void tlb_deliver(n64rt_ctx_t *x, int res, u32 code, u32 bd)
-{
-    u32 badv, cause, ctxt;
-    CP0_GET(8, badv); CP0_GET(13, cause); CP0_GET(4, ctxt);
-    const u32 exl = x->status & 2u, exc = res == TLBX_MOD ? 1u : code == 3u ? 3u : 2u;
-    cause = (cause & ~0x7Cu) | exc << 2;
-    if (!exl) { cause = (cause & 0x7FFFFFFFu) | bd << 31; CP0_SET(14, x->epc); }
-    CP0_SET(13, cause);
-    CP0_SET(4, (ctxt & 0xFF800000u) | ((badv >> 13) << 4));
-    x->status |= 2u;                                                              /* (EXL; the eret to the vector clears ERL) */
-    const u32 was_epc = x->epc;
-    (void)was_epc;
-    x->epc = (res == TLBX_REFILL && !exl) ? 0x80000000u : 0x80000180u;
-    s_tlb_delivered++;
-#ifdef N64RT_DEBUG
-    {   static u32 s_n;
-        if (s_n++ < 8u || (s_n & 4095u) == 0u)
-            n64rt_log("n64rt: TLB %s for the game's handler (#%lu): %s at %08lx, EPC %08lx%s, vector %08lx, Cause %08lx Context %08lx\n",
-                      res == TLBX_REFILL ? "refill" : res == TLBX_INVALID ? "invalid" : "modified", (unsigned long)s_n,
-                      exc == 3u ? "a store" : exc == 1u ? "a store (Mod)" : "a load or fetch", (unsigned long)badv, (unsigned long)was_epc,
-                      bd ? " (delay slot)" : "", (unsigned long)x->epc, (unsigned long)cause, (unsigned long)((ctxt & 0xFF800000u) | ((badv >> 13) << 4)));
-    }
-#endif
-}
-/* a translation-table fault of the game's: the page entered, or the exception taken by its handler (1), or neither (0) */
-static int tlb_fault(n64rt_ctx_t *x, u32 code, u32 bd)
-{
-    if (!n64rt_tlbi) return tlb_fill();
-    const int res = tlb_service(code);
-    if (res == TLBX_FILLED) return 1;
-    if (res == TLBX_NONE) return 0;
-#ifdef N64RT_TLB_FATAL
-    return 0;                           /* (a debugging build: the exception is the runtime's, with the game's registers in the log) */
-#endif
-    tlb_deliver(x, res, code, bd);
-    return 1;
-}
+ * What the runtime does with the TLB is to find where a virtual address the game gave it is -- the instruction a trap came from, in a
+ * page the game mapped; osVirtualToPhysical on the legacy path -- with tlbp and tlbr, putting back the COP0 registers it used (they
+ * are the game's: Index, EntryHi, EntryLo0/1, PageMask). The runtime and the bitstream are a pair: a runtime on a core without the
+ * real TLB (the older bitstreams: translation tables, the monitor doing the TLB instructions) stops at the start. */
+u32 n64rt_tlbreal;                      /* the CPU has the real TLB (COP0 23) */
+#define TLB_CAP_MASK 0xFFFFFF02u
+#define TLB_CAP_VAL  0x544C4202u        /* 'T' 'L' 'B', bit 1: bit 0 is MON, bit 2 cached fetches from mapped pages */
 void n64rt_tlbi_init(void)
 {
     u32 v;
     __asm__ volatile("mfc0 %0, $23" : "=r"(v));
-    n64rt_tlbi = (v & ~8u) == 0x54420001u;
-    for (u32 i = 0; i < TLB_N; i++) s_tlbr[i].hi = 0;               /* (KSEG0: matches nothing) */
+    n64rt_tlbreal = (v & TLB_CAP_MASK) == TLB_CAP_VAL;
+    if (!n64rt_tlbreal)
+        n64rt_fatal("n64rt: this core has no real TLB (COP0 23 reads %08lx): the loader (n64rt.sys) and the bitstream are a pair -- use the loader that came with it\n", (unsigned long)v);
+    /* every entry free (KSEG0's pages, invalid: osUnmapTLBAll's), whatever the bitstream's RAM or a game before this one left */
+    for (u32 i = 0; i < 32u; i++) {
+        __asm__ volatile("mtc0 %0, $0\n\tmtc0 %1, $10\n\tmtc0 $0, $2\n\tmtc0 $0, $3\n\tmtc0 $0, $5\n\t.set push\n\t.set mips3\n\ttlbwi\n\t.set pop"
+                         :: "r"(i), "r"(0x80000000u + (i << 13)));
+    }
+    __asm__ volatile("mtc0 $0, $10");
 }
-#else
-void n64rt_tlbi_init(void) { }
-#endif
 int n64rt_tlb_phys(u32 va, u32 *pa)
 {
-    if (!s_tlb_n) return 0;
-    for (int i = 0; i < TLB_N; i++) {
-        u32 span = s_tlb[i].span, off = va - s_tlb[i].va;
-        if (span && off < 2u * span) {
-            u32 p = s_tlb[i].pa[off >= span];
-            if (p == 0xFFFFFFFFu) return 0;
-            p += off & (span - 1u);
-            if (p >= 0x00800000u) return 0;                 /* (the RDRAM) */
-            *pa = p;
-            return 1;
+    u32 ix, pm, hi, lo0, lo1, ok = 0, p = 0;
+    __asm__ volatile("mfc0 %0, $0" : "=r"(ix));
+    __asm__ volatile("mfc0 %0, $5" : "=r"(pm));
+    __asm__ volatile("mfc0 %0, $10" : "=r"(hi));
+    __asm__ volatile("mfc0 %0, $2" : "=r"(lo0));
+    __asm__ volatile("mfc0 %0, $3" : "=r"(lo1));
+    {
+        u32 key = (va & 0xFFFFE000u) | (hi & 0xFFu), f;
+        __asm__ volatile("mtc0 %0, $10\n\t.set push\n\t.set mips3\n\ttlbp\n\t.set pop\n\tmfc0 %1, $0" : "=r"(key), "=r"(f) : "0"(key));
+        if (!(f >> 31)) {
+            u32 m, h2, l0, l1;
+            __asm__ volatile("mtc0 %0, $0\n\t.set push\n\t.set mips3\n\ttlbr\n\t.set pop" :: "r"(f));
+            __asm__ volatile("mfc0 %0, $5" : "=r"(m));
+            __asm__ volatile("mfc0 %0, $10" : "=r"(h2));
+            __asm__ volatile("mfc0 %0, $2" : "=r"(l0));
+            __asm__ volatile("mfc0 %0, $3" : "=r"(l1));
+            (void)h2;
+            const u32 span = (m + 0x2000u) >> 1, lo = (va & span) ? l1 : l0;
+            p = (((lo >> 6) << 12) & ~(span - 1u)) | (va & (span - 1u));
+            ok = (lo & 2u) && p < 0x00800000u;              /* (valid, and the RDRAM) */
         }
     }
-    return 0;
-}
-/* n bytes at a mapped address, big-endian */
-static int tlb_rd(u32 va, u32 n, u32 *v)
-{
-    u32 r = 0, pa;
-    for (u32 i = 0; i < n; i++) {
-        if (!n64rt_tlb_phys(va + i, &pa)) return 0;
-        r = r << 8 | *(volatile u8 *)(uintptr_t)(0x80000000u | pa);
-    }
-    *v = r;
-    return 1;
-}
-static int tlb_wr(u32 va, u32 n, u32 v)
-{
-    u32 pa;
-    for (u32 i = 0; i < n; i++) {
-        if (!n64rt_tlb_phys(va + i, &pa)) return 0;
-        *(volatile u8 *)(uintptr_t)(0x80000000u | pa) = (u8)(v >> (8u * (n - 1u - i)));
-    }
-    return 1;
+    /* the game's registers back (Index's P bit too: only the monitor level can write it) */
+    __asm__ volatile("mtc0 %0, $5" :: "r"(pm));
+    __asm__ volatile("mtc0 %0, $10" :: "r"(hi));
+    __asm__ volatile("mtc0 %0, $2" :: "r"(lo0));
+    __asm__ volatile("mtc0 %0, $3" :: "r"(lo1));
+    __asm__ volatile("mtc0 %0, $0" :: "r"(ix));
+    if (ok) *pa = p;
+    return (int)ok;
 }
 /* where the branch at pc goes (its delay slot is being done here: it was
  * taken up, so a "likely" one is taken); the registers as before the slot */
@@ -1105,54 +832,6 @@ static int branch_next(n64rt_ctx_t *x, u32 pc, u32 *next)
     *next = take ? rel : pc + 8u;
     return 1;
 }
-/* the load or store that trapped on a mapped page: done, and epc past it */
-static int emulate_mapped(n64rt_ctx_t *x, u32 cause)
-{
-    if (!s_tlb_n) return 0;
-    u32 bd = cause >> 31, pc = x->epc + (bd ? 4u : 0u), next = pc + 4u;
-    if ((pc >> 28) != 0x8u && (pc >> 28) != 0x4u) return 0;                /* (not code: a jump into a page) */
-    u32 insn = *(volatile u32 *)(uintptr_t)pc;
-    u32 op = insn >> 26, rs = (insn >> 21) & 31u, rt = (insn >> 16) & 31u;
-    u32 ea = g32(x, rs) + (u32)(s32)(s16)insn, k = ea & 3u, v, r = g32(x, rt), pa;
-    if (!n64rt_tlb_phys(ea, &pa)) return 0;
-    if (bd && !branch_next(x, x->epc, &next)) return 0;
-    switch (op) {
-    case 0x20: if (!tlb_rd(ea, 1, &v)) return 0; r = (u32)(s32)(s8)v; break;          /* lb */
-    case 0x24: if (!tlb_rd(ea, 1, &v)) return 0; r = v; break;                        /* lbu */
-    case 0x21: if (!tlb_rd(ea, 2, &v)) return 0; r = (u32)(s32)(s16)v; break;         /* lh */
-    case 0x25: if (!tlb_rd(ea, 2, &v)) return 0; r = v; break;                        /* lhu */
-    case 0x23: if (!tlb_rd(ea, 4, &v)) return 0; r = v; break;                        /* lw */
-    case 0x22:                                                                        /* lwl: the bytes from ea to its word's end, at the top */
-        if (!tlb_rd(ea, 4u - k, &v)) return 0;
-        r = k ? (v << (8u * k)) | (r & ((1u << (8u * k)) - 1u)) : v;
-        break;
-    case 0x26:                                                                        /* lwr: from its word's start to ea, at the bottom */
-        if (!tlb_rd(ea - k, k + 1u, &v)) return 0;
-        r = k == 3u ? v : (r & ~((1u << (8u * (k + 1u))) - 1u)) | v;
-        break;
-    case 0x28: if (!tlb_wr(ea, 1, r)) return 0; goto stored;                          /* sb */
-    case 0x29: if (!tlb_wr(ea, 2, r)) return 0; goto stored;                          /* sh */
-    case 0x2B: if (!tlb_wr(ea, 4, r)) return 0; goto stored;                          /* sw */
-    case 0x2A: if (!tlb_wr(ea, 4u - k, r >> (8u * k))) return 0; goto stored;         /* swl */
-    case 0x2E: if (!tlb_wr(ea - k, k + 1u, r)) return 0; goto stored;                 /* swr */
-    case 0x31: if (!tlb_rd(ea, 4, &v)) return 0; x->fpr[rt] = v; goto stored;         /* lwc1 */
-    case 0x39: if (!tlb_wr(ea, 4, x->fpr[rt])) return 0; goto stored;                 /* swc1 */
-    case 0x35:                                                                        /* ldc1: a pair, the high word first */
-        if (!tlb_rd(ea, 4, &v)) return 0; x->fpr[rt | 1u] = v;
-        if (!tlb_rd(ea + 4u, 4, &v)) return 0; x->fpr[rt & ~1u] = v;
-        goto stored;
-    case 0x3D:                                                                        /* sdc1 */
-        if (!tlb_wr(ea, 4, x->fpr[rt | 1u]) || !tlb_wr(ea + 4u, 4, x->fpr[rt & ~1u])) return 0;
-        goto stored;
-    default: return 0;
-    }
-    if (rt) gset(x, rt, r);
-stored:
-    x->epc = next;
-    s_tlb_hits++;
-    return 1;
-}
-
 /* Every thread's state (N64RT_DEBUG, every 2 s of fields: n64rt_io.c) */
 void n64rt_game_dump(void) __attribute__((weak));
 void n64rt_game_dump(void) { }
@@ -1448,10 +1127,6 @@ void n64rt_exception(void)
         /* the boot segment going into the code it loaded: its functions replaced, the instruction again */
     } else if ((code == 4 || code == 5) && emulate_hw(x, cause)) {
         /* an N64 register the game reached directly */
-    } else if (n64rt_tlbram && code >= 1 && code <= 3 && tlb_fill()) {
-        /* a page the game mapped, entered in the CPU's tables: the instruction again */
-    } else if (code >= 2 && code <= 5 && emulate_mapped(x, cause)) {
-        /* a page the game mapped (osMapTLB) */
     } else if (code == 10 && s_probe) {
         s_probe = 2; x->epc += 4;                     /* the probe's instruction: this CPU has none */
     } else if (code == 10 && emulate_64(x, cause)) {
@@ -1518,27 +1193,6 @@ static u32 s_mn;
 u32 n64rt_mon_codes[32];                /* entries by cause, for the log */
 u32 n64rt_mon_epc;                      /* where the game was at the last one */
 #endif
-/* The game's osMapTLB, osUnmapTLB, osUnmapTLBAll, whose first instruction n64rt_boot.c made a reserved one
- * (SPECIAL 0x35, the function's number in the code field): done here with the game's arguments (a0-a3, the rest
- * on its stack), and the game goes on at its return address. */
-static int own_tlb_call(n64rt_ctx_t *x)
-{
-    u32 epc = x->epc;
-    if ((epc >> 28) != 0x8u) return 0;
-    u32 insn = *(volatile u32 *)(uintptr_t)epc;
-    if ((insn & 0xFC00003Fu) != 0x35u) return 0;
-    u32 f = (insn >> 6) & 0xFFFFFu, sp = x->g[29].l;
-    if (f == N64RT_osMapTLB) {
-        const volatile u32 *st = (const volatile u32 *)(uintptr_t)sp;
-        n64rt_osMapTLB((s32)x->g[4].l, x->g[5].l, x->g[6].l, x->g[7].l, st[4], (s32)st[5]);
-    } else if (f == N64RT_osUnmapTLB) {
-        n64rt_osUnmapTLB((s32)x->g[4].l);
-    } else if (f == N64RT_osUnmapTLBAll) {
-        n64rt_osUnmapTLBAll();
-    } else return 0;
-    x->epc = x->g[31].l;
-    return 1;
-}
 void n64rt_mon_exception(void)
 {
     n64rt_ctx_t *x = &n64rt_mon_ctx;
@@ -1556,16 +1210,8 @@ void n64rt_mon_exception(void)
         n64rt_rcp_events();
     } else if ((code == 4 || code == 5) && emulate_hw(x, cause)) {
         /* an RCP register */
-    } else if (n64rt_tlbram && code >= 1 && code <= 3 && tlb_fault(x, code, bd)) {
-        /* a page the game mapped, entered in the CPU's tables (the instruction again), or the exception for the game's handler */
-    } else if (code >= 2 && code <= 5 && emulate_mapped(x, cause)) {
-        /* a page the game mapped (osMapTLB) */
     } else if (code == 10 && s_probe) {
         s_probe = 2; x->epc += 4;
-    } else if (code == 10 && n64rt_tlbi && tlb_insn(x, (int)bd)) {
-        /* the game's own tlbwi / tlbwr / tlbr / tlbp */
-    } else if (code == 10 && !bd && own_tlb_call(x)) {
-        /* osMapTLB / osUnmapTLB / osUnmapTLBAll, the runtime's (n64rt_boot.c: a core that does not take the TLB instructions) */
     } else if (code == 10 && emulate_64(x, cause)) {
         /* a 64-bit instruction */
     } else {
@@ -1632,17 +1278,11 @@ void n64rt_os_init(void)
         u32 m; __asm__ volatile("mfc0 %0, $7" : "=r"(m));
         n64rt_cpu_alu = m >> 31 & 1u; n64rt_cpu_sh = m >> 30 & 1u; n64rt_cpu_md = m >> 29 & 1u;
     }
-    /* and its translation tables: COP0 23 reads their mark, or 0 */
-    {
-        u32 v;
-        __asm__ volatile("mfc0 %0, $23" : "=r"(v));
-        n64rt_tlbram = (v & ~9u) == 0x54420000u;
-        n64rt_tlbi_init();
-        tr_flush();
-    }
+    /* and its TLB: the real one (COP0 23) or no game at all */
+    n64rt_tlbi_init();
 #ifdef N64RT_DEBUG
-    n64rt_log("n64rt: the CPU %s the 64-bit integers (alu %lu, shifts %lu, dmult %lu), %s translation tables\n", n64rt_cpu64 ? "has" : "is without",
-              (unsigned long)n64rt_cpu_alu, (unsigned long)n64rt_cpu_sh, (unsigned long)n64rt_cpu_md, n64rt_tlbram ? "has" : "no");
+    n64rt_log("n64rt: the CPU %s the 64-bit integers (alu %lu, shifts %lu, dmult %lu), the real TLB\n", n64rt_cpu64 ? "has" : "is without",
+              (unsigned long)n64rt_cpu_alu, (unsigned long)n64rt_cpu_sh, (unsigned long)n64rt_cpu_md);
     if (s_count_q8 < 250u || s_count_q8 > 262u)
         n64rt_log("n64rt: the CPU's clock is %lu.%02lu times the SoC's\n", (unsigned long)(s_count_q8 >> 8), (unsigned long)(((s_count_q8 & 255u) * 100u) >> 8));
 #endif

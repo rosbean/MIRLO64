@@ -19,13 +19,6 @@ static inline void ints_on(u32 m) { if (m) { u32 s; __asm__ volatile("mfc0 %0, $
 /* ---- misc ------------------------------------------------------------------ */
 void n64rt_osInitialize(void) { }
 u32 n64rt_osGetMemSize(void) { return n64rt_game->mem_size; }
-u32 n64rt_osVirtualToPhysical(u32 va)
-{
-    if ((va >> 30) == 2u) return va & 0x1FFFFFFFu;            /* KSEG0 / KSEG1 */
-    u32 pa;
-    if (n64rt_tlb_phys(va, &pa)) return pa;                   /* a page the game mapped (n64rt_os.c) */
-    return 0xFFFFFFFFu;            /* libultra: the TLB probe finds nothing */
-}
 /* The D-cache writes through: memory is always current, and a line another
  * master overwrote is dropped by an invalidate. The I-cache: a fragment the
  * game has just loaded (and relocated) must be fetched anew. */

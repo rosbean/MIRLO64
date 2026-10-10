@@ -133,6 +133,8 @@ typedef struct { u16 type; u8 status; u8 errnum; } OSContStatus;
 typedef struct { u16 button; s8 stick_x; s8 stick_y; u8 errnum; } OSContPad;
 
 /* ---- the replaced functions: X(libultra name) ------------------------- */
+/* (the TLB's are not replaced any more -- the CPU has the real TLB, the game's own run -- but keep their places: the game tables name them) */
+#define N64RT_TLB_FUNCS(X) X(osVirtualToPhysical) X(osMapTLB) X(osUnmapTLB) X(osUnmapTLBAll)
 #define N64RT_FUNCS(X) \
     X(osInitialize) X(osGetMemSize) X(osVirtualToPhysical) X(osMapTLB) X(osUnmapTLB) X(osUnmapTLBAll) \
     X(osCreateThread) X(osStartThread) X(osStopThread) X(osDestroyThread) \
@@ -295,7 +297,8 @@ int n64rt_other_task(OSTask *t);
 void n64rt_vi_field(void);                 /* a VI field elapsed (n64rt_tick) */
 /* an RCP register the game reaches itself (the trap): 1 = done */
 int n64rt_hw_read(u32 addr, u32 *v);
-int n64rt_tlb_phys(u32 va, u32 *pa);       /* a page the game mapped (osMapTLB): 1, and its RDRAM address */
+int n64rt_tlb_phys(u32 va, u32 *pa);       /* a page the game mapped: 1, and its RDRAM address (the CPU's TLB: tlbp, tlbr) */
+void n64rt_tlbi_init(void);                /* the real TLB, or a fatal error: the loader and the bitstream are a pair */
 int n64rt_hw_write(u32 addr, u32 v);
 
 #endif

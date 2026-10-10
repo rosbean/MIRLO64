@@ -1,5 +1,5 @@
 // Mirlo's game CPU on the MIPS SoC: mips_core (rtl/mips/mips_core.sv) with
-// MIRLO's memory map -- no TLB, big-endian (the N64's order), every address
+// MIRLO's memory map -- the VR4300's TLB, big-endian (the N64's order), every address
 // physical but the N64 window:
 //   0x4000_0000-0x43FF_FFFF  SDRAM, cached (the s_* port: lines and words)
 //   0x1FC0_0000-0x1FC0_0FFF  the boot ROM (KSEG1 0xBFC0_0000: the reset
@@ -55,14 +55,12 @@ logic [31:0] c_addr, c_wdata, c_rdata, dbg_status;
 logic [3:0]  c_strb;
 logic        hwx_on;
 
-// The TLB. An N64 game's mapped addresses are those below 0x2000_0000 (Super
-// Mario 64's title-screen head at 0x0400_0000); a miss is the N64's
-// exception, at Mirlo's vector. mips_core's translation table is in block
-// RAM, which the runtime fills from what the game maps (~75 ALMs, 4 M10K).
-localparam bit CPU_TLB = 1'b0;
-localparam bit CPU_TLB_RAM = 1'b1;
-// mips_core's FPG: two page registers on the fetch side, so that code run from a mapped page whose table entry is
-// cacheable (COP0 23's bit 5) goes through the I-cache. MIRLO_NO_FPG: a mapped fetch is the slow path (A/B in the sim)
+// The TLB: the VR4300's, 32 entries (tlbwi, tlbwr, tlbp, tlbr and the TLB exceptions are the CPU's own; mips_core's
+// "The TLB"). An N64 game's mapped addresses are those below 0x2000_0000 (Super Mario 64's title-screen head at
+// 0x0400_0000) and, with the monitor, 0x6000_0000 - 0x7FFF_FFFF (GoldenEye's code); a miss is the game's own exception.
+localparam bit CPU_TLB = 1'b1;
+// mips_core's FPG: a fetch from a mapped page whose entry is cacheable (EntryLo's C field is not 2) goes through the I-cache,
+// by the fetch micro-TLB's translation. MIRLO_NO_FPG: a mapped fetch is the slow path (A/B in the sim)
 `ifdef MIRLO_NO_FPG
 localparam bit CPU_FPG = 1'b0;
 `else
@@ -101,7 +99,7 @@ localparam bit CPU_PI2W = CPU_PIW;
 `ifndef MIRLO_CPU_DC_LOG2
 `define MIRLO_CPU_DC_LOG2 10
 `endif
-mips_core #(.TLB_EN(CPU_TLB), .TLB_RAM(CPU_TLB_RAM), .FLAT(1), .BIG(1), .N64WIN(1), .MON(CPU_MON), .MI(CPU_MI), .PIW(CPU_PIW), .VIW(CPU_VIW), .AIW(CPU_AIW), .SIW(CPU_SIW), .PI2W(CPU_PI2W), .EXC_BASE(32'h4000_0000), .W64(CPU_W64), .W64_ALU(CPU_W64_ALU), .W64_SH(CPU_W64_SH), .W64_MD(CPU_W64_MD), .W64_DIV(CPU_W64_DIV), .FAST(CPU_FAST), .FPG(CPU_FPG),
+mips_core #(.TLB_EN(CPU_TLB), .FLAT(1), .BIG(1), .N64WIN(1), .MON(CPU_MON), .MI(CPU_MI), .PIW(CPU_PIW), .VIW(CPU_VIW), .AIW(CPU_AIW), .SIW(CPU_SIW), .PI2W(CPU_PI2W), .EXC_BASE(32'h4000_0000), .W64(CPU_W64), .W64_ALU(CPU_W64_ALU), .W64_SH(CPU_W64_SH), .W64_MD(CPU_W64_MD), .W64_DIV(CPU_W64_DIV), .FAST(CPU_FAST), .FPG(CPU_FPG),
             .IC_LOG2(`MIRLO_CPU_IC_LOG2), .DC_LOG2(`MIRLO_CPU_DC_LOG2), .XWB(XWB)) cpu (
     .clk, .rst, .reset_pc(32'hBFC0_0000),
     .mem_req(c_req), .mem_addr(c_addr), .mem_we(c_we), .mem_wdata(c_wdata), .mem_wstrb(c_strb), .mem_line(c_line), .mem_wrun(s_wrun),

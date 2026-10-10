@@ -1,8 +1,8 @@
-/* tlb_bench: a game for the runtime's TLB instructions (n64rt_os.c tlb_insn, and n64rt_exc.S's fast path for them) -- a program
+/* tlb_bench: a game for the CPU's TLB instructions (mips_core's real TLB: they are the CPU's own, no runtime does them) -- a program
  * linked for 0x8000_0400 that runs as a game under the loader (OWN) on the SoC in sim/mips_soc. What it does:
  *   1. checks the instructions' RESULTS: tlbwi of entries with known registers, tlbr back (PageMask, EntryHi without the bits under
  *      the mask, G in both EntryLo), tlbp finding each by VPN2 / ASID (a global one under another ASID too) and giving P when none,
- *      an Index of 32 or more writing nothing, tlbwr, an entry replaced, an unmap-all after mapped ones. The tlbr reads and tlbp
+ *      tlbwr, an entry replaced, an unmap-all after mapped ones. The tlbr reads and tlbp
  *      answers (not tlbwr's Random) are also folded into one checksum, which every runtime must agree on.
  *   2. times them, in the CPU's clocks, from a mark to a mark (sim/mips_soc CPUSTAT=1 prints the cycles between): 32 x ROUNDS tlbr
  *      (the refill handler's walk), tlbp that finds nothing (32 entries looked at), tlbp that finds the last entry, tlbwi that
@@ -77,9 +77,8 @@ void game_main(void)
     MTC0(10, 0x40000008u); TLBP(); check(20, MFC0(0), NOTFOUND);   /* (its odd page is not global: the ASID matters) */
     MTC0(10, 0x50000000u); TLBP(); check(21, MFC0(0), NOTFOUND);
     for (u32 a = 0; a < 6; a++) { MTC0(10, 0x20000000u + (a << 12) + 5u); TLBP(); fold(MFC0(0)); }
-    /* an Index of 32 or more writes nothing */
-    write_entry(33, 0, 0x60000001u, 0x5Eu, 0x5Eu);
-    MTC0(10, 0x60000001u); TLBP(); check(22, MFC0(0), NOTFOUND);
+    /* (an Index of 32 or more is undefined on the VR4300: the core uses Index & 31, as the model does -- nothing to check here) */
+    check(22, 0, 0);
     /* tlbwr at Random (Wired 0): the entry is somewhere, tlbp finds it, tlbr gives it back */
     MTC0(5, 0); MTC0(10, 0x60000001u); MTC0(2, 0x5E); MTC0(3, 0x5E); TLBWR();
     MTC0(10, 0x60000001u); TLBP();
@@ -134,6 +133,18 @@ void game_main(void)
     MARK(0xA5000000u);
     for (u32 r = 0; r < ROUNDS * 4; r++) { MTC0(5, 0); MTC0(10, 0x60000000u + (r << 13)); MTC0(2, 0x5E); MTC0(3, 0); TLBWR(); }
     MARK(0xA6000000u);
+    /* the runtime reads the game's code where the CPU's TLB maps it: a device access (SP_STATUS) from code on a mapped page is the monitor's
+     * to do, and it has to find the instruction (n64rt_tlb_phys: tlbp, tlbr) */
+    {
+        volatile u32 *c = K1(0x00320000u);
+        c[0] = 0x3C08A404u; c[1] = 0x8D090010u; c[2] = 0x03E00008u; c[3] = 0x01201025u;     /* lui t0, 0xA404 / lw t1, 0x10(t0) / jr ra / or v0, t1, zero */
+        unmap_all();
+        write_entry(5, 0, 0x08000000u, LO(0x00320000u, 1), LO(0x00321000u, 1));
+        u32 r = ((u32 (*)(void))0x08000000u)();
+        u32 w = *(volatile u32 *)0xA4040010u;
+        check(31, r, w);
+        REPORT[11] = r;
+    }
     REPORT[10] = 0xD0DEu;                                          /* (done) */
     for (;;) ;
 }

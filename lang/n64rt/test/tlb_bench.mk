@@ -1,4 +1,4 @@
-# tlb_bench: the runtime's TLB instructions (tlb_bench.c) as a game on the SoC in sim/mips_soc: their results, and what each costs.
+# tlb_bench: the CPU's TLB instructions (tlb_bench.c) as a game on the SoC in sim/mips_soc: their results, and what each costs.
 #
 #   make -f tlb_bench.mk [MIRLO=<checkout>] [BUILD=<dir>] [MIPS_CC=... MIPS_BIN=...]       -> $(BUILD)/tlb_bench.z64
 #   (a ROM the OWN loader runs as it is). A loader made with TLBPROF=1 turns the game's stores to 0x0490_0004 into the simulation's

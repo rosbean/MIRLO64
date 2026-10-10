@@ -28,8 +28,8 @@ path sit beside the cores.
 | `0xF000_0000` | the registers: `rtl/soc/mirlo_regs.sv`, map in `tools/mirlo_regs.py` |
 | `0xBFC0_0000` | the game CPU's boot ROM (`lang/mips/boot`) |
 
-The game CPU has no TLB and no KSEG0: `mips_core` is built with `FLAT`, so
-every address is physical except the boot ROM's KSEG1, SDRAM is the cached
+The game CPU's own code and data have no KSEG0: `mips_core` is built with `FLAT`, so
+every address is physical except the boot ROM's KSEG1, the N64 game's RDRAM window and its TLB pages (below), SDRAM is the cached
 span, and the exception vector is `0x4000_0180`. It is big-endian (`BIG`
 1), as the N64: memory is word-native (a 32-bit word is its value in any
 order), byte k of a word sits in lane 3 - k. The Pocket's bridge loads a
@@ -171,145 +171,78 @@ and with save files on the card it keeps out of `0x4310_0000` -
 
 ### The TLB
 
-The game CPU has none of the VR4300's kind in the SoC (`mips_core`'s
-`TLB_EN`; the macro `MIRLO_TLB` that put its 32 entries in, ~550 ALMs, was removed). An N64
-game's mapped addresses are those below `0x2000_0000`; the runtime keeps the
-game's `osMapTLB` entries, and what happens at a mapped address depends on
-the CPU:
+The game CPU has the VR4300's own: `mips_core`'s `TLB_EN`. 32 entries, each a pair of pages of 4 KiB to 16 MiB
+(PageMask), fully associative on VPN2 and ASID (a global entry -- both EntryLos' G -- matches any), and the
+instructions `tlbwi`, `tlbwr`, `tlbr` and `tlbp` are the CPU's. There is nothing of it in the runtime: no table of the
+game's entries, no patch of `osMapTLB` / `osUnmapTLB` / `osUnmapTLBAll` / `osVirtualToPhysical` / `__osProbeTLB` (the game's own run
+as they are, wherever the game keeps them), no instruction trap, no table of games, and an exception of the TLB is the
+game's own handler's. This replaced, in one go, the translation tables in block RAM that the runtime filled (`TLB_RAM`),
+the monitor's trap of the TLB instructions (a Reserved Instruction, ~930 cycles each) and its delivery of the misses, and the
+fetch page registers (`FPG`'s two, now the fetch micro-TLB).
 
-- `MIRLO_TLB_RAM` (`mips_core`'s `TLB_RAM`): two translation tables in block
-  RAM, one for data and one for fetches, 512 entries each -- one for a 4 KiB
-  page, by its number's low 9 bits. A mapped access or fetch reads its page's
-  entry (four cycles); if that is not this page's, valid and of this ASID, it
-  takes the TLB's exception, the runtime writes the entry from the game's
-  (`tlb_fill`: a page of any size, 4 KiB at a time, through COP0 register 23)
-  and the instruction runs again. A page costs one exception however much it
-  is used. The tables are emptied when the game maps or unmaps. Code runs from a
-  mapped page: with a data access (and an entry without the C bit) it is the slow
-  path, one uncached word at a time; a fetch from a page whose entry has the C bit
-  (COP0 23's bit 5, from the game's EntryLo C field) goes through the I-cache --
-  see "The fetch page registers" below.
-  It costs the CPU ~120 ALUTs and 50 registers (~200 and 55 on the CPU
-  without 64-bit integers) and 4 M10K: 73 ALMs in the fit.
-- neither: a load or store to a mapped page traps (an address error) and the
-  runtime does it on the game's behalf, thousands of times an access's cost;
-  code cannot run there.
+**The CPU and the runtime are a pair.** COP0 register 23 reads a capability word: `'T' 'L' 'B'` in bits 31:8, bit 0 MON (the
+monitor level), bit 1 a real TLB, bit 2 cached fetches from mapped pages. `n64rt.sys` checks bit 1 as it starts and stops with a
+message on a core that has not got it (the older bitstreams, whose COP0 23 reads `0x5442_000x` and whose loaders emulate the TLB);
+an older loader on this core finds no tables and does not work either: install the bitstream (`mips.rev`) and the loader
+(`n64rt.sys`) that were built together.
 
-With `MIRLO_MON` (and the game running, `MCTL.GAME`) the game's own TLB
-instructions -- `tlbwi`, `tlbwr`, `tlbr`, `tlbp` -- are a Reserved Instruction
-for the monitor level (COP0 register 23's bit 0 says the core does that): the
-runtime (`n64rt_os.c`, `tlb_insn`) keeps the 32 entries as the registers gave
-them and does each as the VR4300 would on the game's COP0 registers (`tlbp`
-searches them by VPN2 and ASID and sets Index's P bit on a miss -- the one bit
-of a game's COP0 that only the monitor level can write by `mtc0`; `tlbr` gives
-the registers back), and fills the translation tables from them as before. The
-game's own `osMapTLB`, `osUnmapTLB`, `osUnmapTLBAll`, `__osProbeTLB` and
-`osVirtualToPhysical` run as they are, wherever the game keeps them (a segment
-it unpacks or loads later too): nothing of libultra has to be found or
-patched, and there is no table of games at all (the loader has none). The cost is
-a few LUTs (the decode gate and Index's bit 31); `lang/mips/test/tlbmon_test.c`
-checks it (`sim/mips_soc`, a SoC built with `MIRLO_TLB_RAM` and `MIRLO_MON`).
+*What is stored.* An entry: VPN2 (19 bits, the bits under the mask clear), ASID (8), PageMask (the VR4300 keeps it as six bits,
+one for each pair of mask bits -- a write of `0x2000` reads back 0, `0x4000` reads `0x6000`), G, and two 25-bit EntryLos (PFN[25:6],
+C, D, V: EntryLo has 26 bits, as the VR4300's). 84 bits x 32 in three M10K, written by `tlbwi` (Index & 31) and `tlbwr` (Random, which
+runs from 31 down to Wired), read by `tlbr` and searched by `tlbp`: the scanner, one entry a cycle, from entry 0, the first that
+matches (duplicates are undefined on the VR4300; here the lowest index wins).
 
-**The game's TLB instructions on the monitor's fast path, and the C bit.** `tlbr`, `tlbp` and the `tlbwi` that changes no
-translation (osUnmapTLBAll's thirty-two: the entry it replaces maps nothing and the one it writes has both pages invalid) are done
-in `exception_entry` (`n64rt_exc.S`, `n64rt_mon_tlbq`), not by C behind the full path's save of the game's thirty registers, the
-FPRs, HI and LO: the instruction is recognised (cause 10, not in a delay slot, code in KSEG0, `0x4200_0001 / 2 / 8`) with `$k0`
-and `$k1`, seven of the game's registers (`$8`-`$14`) go to the context for the work and come back, and the entries are read and
-written where C keeps them (`n64rt_tlbr`, 16 bytes each: mask, hi ^ 0x8000_0000, lo0, lo1; `n64rt_tlbs`, osMapTLB's table, whose
-`span` says whether an entry maps anything). A `tlbwi` is checked with `$k0` / `$k1` alone first, so that the ones that map or
-unmap a page, a `tlbwr` and everything else (a delay slot, code outside KSEG0) take the full path as before, with nothing changed
-(the walk of `tlb_insn`, the tables to empty). Measured with `lang/n64rt/test/tlb_bench.c` (a game that checks the instructions'
-results -- the same checksum before and after -- and times them from mark to mark in the simulation; a loader built with
-`TLBPROF=1`), CPU clocks an instruction with warm caches, the game's own `mtc0`s included:
+*How it is searched.* The scanner is shared by F and M; a search costs 3 + the matching index cycles. A mapped access is not searched each
+time: F keeps the last two pages it translated and M the last one, in registers (the micro-TLBs: F's with the page's size, so that
+GoldenEye's 4 MiB window is one entry; M's a 4 KiB page of whatever size the entry's pages are), which are emptied by anything that can
+change a translation -- `tlbwi`, `tlbwr`, `tlbr` (it loads EntryHi), a new ASID in EntryHi -- and a search under way at that moment is
+dropped (`sc_stale`) and made again. The micro-TLBs hold no ASID. A data access that hits one spends one cycle in the translation state
+(`MS_XLAT`) and then goes the slow path (one uncached word; a store through the write buffer, whose line the D-cache drops); a fetch
+from a page whose C field is not 2 (uncached) runs through the I-cache like KSEG0's -- see "The fetch micro-TLB" below. Measured
+(`sim/mips_soc`, TLBLOG=1) on GoldenEye with two entries for M and with one: its boot window (the first fetch from the 4 MiB window at
+`0x7000_0000` to the first refill at `0x7F00_0000`) is 17.9 M CPU cycles in both, the pager 3-5 % slower with one; the study's streams
+(`~/n64-fidelity/tlb_alternatives.md`) gave 0.41 % of the fetches for two F entries (whole-entry pages) and 39 data accesses for two M entries
+of 4 KiB pages.
 
-| | full path (before) | fast path |
-|---|---|---|
-| `tlbr` (GoldenEye's refill handler walks the 32 entries with one each) | 576 | 203 |
-| `tlbp`, 32 entries looked at, none or the last one | 963 | 592-596 |
-| `tlbwi` that changes nothing | 649 | 218 |
-| `tlbwi` that maps or unmaps a page | 690 | 803 |
-| `tlbwr` | 715 | 804 |
+*The exceptions.* A page no entry names is a refill (Cause.ExcCode TLBL 2 for a load or a fetch, TLBS 3 for a store) at `0x8000_0000` while
+Status.EXL is clear and at `0x8000_0180` otherwise; an entry that names it with V clear the same codes at `0x8000_0180`; a store to a page with
+D clear is Mod (1) at `0x8000_0180` (TLBS wins when the page is invalid too). BadVAddr takes the address, Context's BadVPN2 (bits 22:4) its
+VPN2, EntryHi's VPN2 too (the ASID is kept), EPC the instruction (the branch, with Cause.BD, in a delay slot; neither is touched when EXL
+was set), Status.EXL is set. A fetch fault is taken when the instruction would have been executed (a fetch ahead of a branch that was
+not taken is dropped silently); the pipeline carries it as code 18 (a fetch refill: vector 0x8000_0000) or 2. Whose the exception is:
+an instruction of the *game's* -- fetched from KSEG0's window (0x8000_0000 + 8 MiB) or from a mapped page -- is the game's own, at the
+vectors above in the RDRAM (MCTL.GAME; the monitor level is not entered); the program's own (the SDRAM, Mirlo's runtime and the tests)
+goes to `EXC_BASE + 0x180` for the program's `trap_handler`. KSEG1 and the RSP, SDRAM and PSRAM windows are not mapped (see "Where a game can map").
 
-The two slower rows pay for the check that they are not for the fast path (~110 and ~90 clocks); every other Reserved Instruction
-(a 64-bit instruction the runtime does for the game) pays the first part of it (~40). `tlbp`'s time is the thirty-two entries
-(~17 clocks each). The entries the TLB's walk fills into the CPU's tables carry the page's **C bit** now: COP0 register 23's write
-has a bit 5, `TR_C`, set when the entry's cache attribute (EntryLo bits 5:3) is not 2 (uncached), and always for osMapTLB's
-entries. `mips_core`'s tables have no field for it (`tre_t` is `{v, d, g, asid, tag, pfn}`; bit 5 of the write is ignored) and
-every mapped access is uncached, a word at a time, so nothing changes today; a core that caches mapped pages only has to take the bit (the
-fetch table does now: see the fetch page registers below).
+*What a mapped page is physically.* The N64's RDRAM only (`tphys`: pa[22:0] into the SDRAM at `0x4380_0000`); a game that maps the cartridge or
+the RCP's registers through the TLB gets the RDRAM wrapped, not the device. LLAddr is the N64's physical address >> 4.
+The coherence is that of KSEG0's: the D-cache is write-through and a mapped store drops the line its frame has; a mapped *load* is always
+uncached; the I-cache is virtually indexed and physically tagged (below).
 
-**The fetch page registers (`FPG`).** Fetching a mapped page one uncached word at a
-time is 20-25 cycles an instruction (GoldenEye's boot, which runs from a 4 MiB window at
-`0x7000_0000`, took 115 M cycles). `mips_core`'s two page registers hold the last two
-cacheable pages of the fetch table that a walk found (virtual page, ASID / global, physical
-page); F delivers the I-cache's word as it does for KSEG0 and D checks it a cycle later
-(`d_fmiss`): a register must hold the page, and the line's tag must be the register's
-physical page. The cache is indexed by the virtual address, as the VR4300's, and tagged by the
-physical one -- `{valid, pa[28:12]}`, two bits wider than KSEG0 alone needs, because a frame
-at another colour (index bits above the page offset) than its virtual address's would else hit
-a line of its neighbour. A page no register holds walks the table (four cycles, the entry loads
-the older register) and F goes back to the cache; one whose line is not in the cache refills
-it. Every write to COP0 23 empties both registers (so the runtime has nothing extra to do: `tr_flush`, `tr_inval`
-and every fill are such writes), and an ASID other than the entry's is no hit. The C bit is
-`n64rt`'s from the game's EntryLo: a page without it is the slow path as before (and costs a
-few cycles more per word: F takes the cache's word, D drops it, the table is walked).
-*Aliases*: a frame mapped at a virtual address whose bits [14:12] differ from the frame's
-(the VR4300 has two such colour bits; this cache has three) can sit in the cache under two
-indexes; once a walk enters such a page (`ic_alias`), Hit_Invalidate_I and its siblings drop
-the line under all 8 colours (8 cycles in M instead of one), so code rewritten and invalidated
-through any alias is the new code through all. A game that maps nothing, or only pages of the
-frame's own colour, never pays it. `lang/mips/test/tlbpg_test.c` checks it (speed, replacement,
-unmap / remap / ASID, four aliases, page boundaries); `tlbgame_test` and `tlbmon_test` run
-code through the game's own tlbwi. Cost (quartus_map of the whole SoC, `mips_core:cpu` self, FPG on against off):
-+101 ALUT and +126 registers (the whole-design ALM estimate +54, inside its +-70 noise), +3,072 RAM bits and no
-M10K (the table entry grows by one bit, the I-cache tag from 16 to 18 bits, each within the same two blocks).
-Not fitted yet.
+**Where a game can map.** The N64's whole KUSEG, 0 - 0x7FFF_FFFF, is the TLB's; Mirlo's own map has the RSP at `0x2000_0000`, the SDRAM (the
+runtime, running at the game's level too, for the helpers it lends) at `0x4000_0000` and the PSRAM at `0x5000_0000`. A core with `TLB_EN` and `MON`
+maps `0x0000_0000 - 0x1FFF_FFFF` and `0x6000_0000 - 0x7FFF_FFFF` (`MAP_HI`; GoldenEye maps and runs from `0x7000_0000` and pages 4 KiB pairs at
+`0x7F000000`). Pages from `0x2000_0000` to `0x5FFF_FFFF` and KSEG2 / KSEG3 are not a game's to map (the n64-systemtest cases that do fail).
 
-**A page no entry maps is the game's own handler's.** The tables are filled from
-the game's entries a 4 KiB page at a time, as an access misses them; what its
-entries do not map is a TLB exception *of the game*, delivered as the VR4300 does
-(`n64rt_os.c`, `tlb_service` / `tlb_deliver`): no entry names the page -- TLBL
-(a load or a fetch, Cause.ExcCode 2) or TLBS (a store, 3), at the refill vector
-`0x8000_0000` if the game's EXL is clear and at `0x8000_0180` if it is set; an
-entry names it with V clear -- the same codes at `0x8000_0180`; a store to a page
-whose D bit is clear -- Mod (1) at `0x8000_0180` (the tables take a page's D bit
-from its entry: a clean page is entered read-only). The monitor sets what the CPU
-does for an exception it takes itself -- BadVAddr and EntryHi's VPN2 and ASID (the
-CPU's, when the access missed), EPC (the branch's, with Cause.BD, in a delay slot;
-neither is touched when EXL was set), Cause.ExcCode, Context's BadVPN2 field,
-Status.EXL -- and returns to the vector. The game's handler (GoldenEye maps
-0x7F000000 from one: a table read through Context, `tlbwr`, `eret`) runs as it is,
-its `tlbwr` the monitor's (`tlb_insn`), and the access then runs again, finds the
-tables empty for the page and fills it from the entry the handler wrote. The two
-mtc0 writes that need are the monitor level's alone, like Index's P bit: Cause's
-BD and ExcCode bits and Context's BadVPN2 (ERL set; two enables in `mips_core.sv`,
-a few LUTs). A core without them gives the handler the vector and EPC all the same;
-the codes are what the CPU last had. `lang/mips/test/tlbgame_test.c` checks it
-(refill of a load, a store and a fetch with every register the handler sees, the
-odd page, a delay slot, ASID, an invalid page, Mod, EXL set, a replaced pair);
-a page replaced by `tlbwr` empties only its own pages of the tables (not all of
-them).
+**The fetch micro-TLB (`FPG`).** Fetching a mapped page one uncached word at a time is 20-25 cycles an instruction (GoldenEye's boot, which
+runs from a 4 MiB window at `0x7000_0000`, took 115 M cycles). A fetch from a mapped page is taken from the I-cache as KSEG0's is: F delivers the
+cache's word at once and D checks it a cycle later (`d_fmiss`): one of F's two micro-TLB entries must hold the page (C not 2) and the line's tag must
+be the entry's physical page. The cache is indexed by the virtual address, as the VR4300's, and tagged by the physical one -- `{valid, pa[28:12]}`, two
+bits wider than KSEG0 alone needs, because a frame at another colour (index bits above the page offset) than its virtual address's would else hit a
+line of its neighbour. A page no entry holds is searched (a few cycles per entry) and F goes back to the cache; a line that is not in the cache is
+refilled. *Aliases*: a frame mapped at a virtual address whose bits [14:12] differ from the frame's (the VR4300 has two such colour bits; this cache
+has three) can sit in the cache under two indexes; once a search enters such a page (`ic_alias`), Hit_Invalidate_I and its siblings drop the line under all
+8 colours (8 cycles in M instead of one), so code rewritten and invalidated through any alias is the new code through all. The sweep takes those cycles:
+an instruction fetched in them can still hit the old line, so the code that is to run the new one is a few instructions after the cache op. A game that
+maps nothing, or only pages of the frame's own colour, never pays it. `lang/mips/test/tlbpg_test.c` checks it (speed, replacement, unmap / remap / ASID,
+four aliases, page boundaries).
 
-**Where a game can map.** The N64's whole KUSEG, 0 - 0x7FFF_FFFF, is the TLB's; Mirlo's
-own map has the RSP at `0x2000_0000`, the SDRAM (the runtime, running at the game's
-level too, for the helpers it lends) at `0x4000_0000` and the PSRAM at `0x5000_0000`. A
-core with `TLB_RAM` and `MON` maps `0x0000_0000 - 0x1FFF_FFFF` as before and now
-`0x6000_0000 - 0x7FFF_FFFF` too (`MAP_HI`: `kseg01` and `n64code`, the same one-LUT
-decode on the address): nothing of Mirlo's is there without the audio core (a build
-with it, the legacy ones, does not set `MON`). GoldenEye's first code maps 4 MiB at
-`0x7000_0000` onto the RDRAM's first 4 MiB (the odd page invalid) and jumps to its
-own code there: without this it ran off its end through zeros, for ever. Pages from
-`0x2000_0000` to `0x5FFF_FFFF` are still not a game's to map.
-
-The runtime finds the tables as it starts (COP0 register 23 reads their
-mark, or 0), so one game file runs on both. `lang/mips/test/tlbram_test.c`
-checks the tables in `sim/mips_soc` (a SoC built with `MIRLO_TLB_RAM`): data,
-a store to a clean page, another page of the same index, the ASID, a fetch,
-code and its data on pages of one index, a delay slot on the page after its
-branch's. Addresses from `0x2000_0000` up (the rest of KUSEG, KSEG2) are
-Mirlo's own in this memory map and are not mapped. Super Mario 64 builds its
-title screen's head with 51 TLB exceptions instead of 200,232 accesses done
-by the runtime (two seconds during which it drew nothing).
+**Tests.** `sim/mips/tlb_rom.c` (`tlb_rom.sh`): a directed program for the lockstep bench, the model (MIRLO64's `sim/n64`) and the RTL agreeing on every
+register written and every exception's code and vector -- seven page sizes with odd and even pages, ASID and global, invalid and clean pages, a refill and a
+fault in a delay slot, with EXL set, of a fetch, tlbr / tlbp / tlbwi / tlbwr and Random / Wired, KUSEG's top and KSEG2. In `sim/mips_soc`:
+`tlbmon_test` (the instructions' results, PageMask / EntryLo masks, the replaced entry), `tlbgame_test` (the game's own handlers at `0x8000_0000` /
+`0x8000_0180` in the RDRAM, with every register they see), `tlbpg_test` (the cached fetch) and `tlbreal_test` (all seven sizes, the micro-TLBs, the exceptions,
+Index / Random / Wired, caches, LL/SC, `0x6000_0000`); `lang/n64rt/test/tlb_bench.c` runs the instructions as a game under the loader.
 
 ### The VR4300's 64-bit integers
 
@@ -677,7 +610,7 @@ retrace with its mode set (field 30) showed RDRAM 0 for one field in the fast bu
 game's own black / origin order racing the latch -- where the build without it, and the DEBUG build with it, show black.
 
 One check was added to the device fast path: a load of `PI_DRAM_ADDR` or `PI_CART_ADDR` goes to the full path (which masks it;
-their stores stay on the fast path). The game's TLB instructions have a fast path of their own (above).
+their stores stay on the fast path).
 
 ### The RCP's registers as the console has them (the monitor's emulation)
 
@@ -721,7 +654,7 @@ Everything of the RCP that is not a small hardware block is emulated by the moni
 
 `lang/n64rt/test/rcp_bench.c` (`rcp_bench.mk`) is a game that does each of these and checks the console's answers (40 checks; the
 runtime before this stops at its first sub-word store to DMEM; the CPU's DPC writes are counted apart, as only a core with their
-path passes them); `tlb_bench.c` does the same for the TLB instructions and times them.
+path passes them); `tlb_bench.c` runs the TLB instructions as a game, checks them and times them.
 
 Checked with n64-systemtest (the slices of the survey, one run of each with the runtime before and after, on the same SoC build):
 24 entries went from failing to passing and none the other way -- `spmem` SB, SH, SD, SW (out of bounds) and the ten DMA ones
@@ -729,8 +662,15 @@ Checked with n64-systemtest (the slices of the survey, one run of each with the 
 (cart address masking, DMA CART -> RDRAM, its small sizes) and "SP Register Read Access From RSP". On a core with the CPU's DPC write path
 and the RSP's DMA queue (the RTL of the own-fid-sys branch, run from a copy) the six `rdp` entries pass as well -- the forward of the
 CPU's DPC writes needs it -- and so does the semaphore read. What still fails of those groups: the MI's repeat mode (RTL), the
-cartridge's write latch and PI_STATUS bits (the hardware's own word reads), the DMAs with a misaligned PI_DRAM_ADDR; the TLB group
-is as before, entry for entry.
+cartridge's write latch and PI_STATUS bits (the hardware's own word reads), the DMAs with a misaligned PI_DRAM_ADDR.
+
+The TLB and COP0 groups with the real TLB (same slices, the runtime and the SoC before and after, the survey's scratch loader): 23 entries went
+from failing to passing and none the other way -- `Index (masking)` (P is written by an mtc0), `Wired OOB/Random` (Random has 6 bits), `PageMask after TLBWI/TLBR`,
+the seven `Read after <4k .. 16M> page, expect TLBL` and the two `Store after 4k page`, `Execute code that is not currently tlb mapped`, `Execute mapped branch
+with has a non-mapped delay slot`, `TLBL on first fetch after ERET`, the `Read inside 4k page which isn't valid` (and from a delay slot), the three `Store inside
+4k page` (not valid, not dirty, neither: TLBS wins), `LW tlb miss test (32 bit)`, and from the LL/SC group `LL/SC aliases via TLB use physical LLAddr` and `LL (sign
+extension + LLAddr)` (LLAddr is the N64's physical address). Still failing: the three that need the VR4300's 64-bit EntryHi (`EntryHi (masking)`,
+`EntryLo0/1/Hi after TLBWI/TLBR`: dmfc0 reads the register zero-extended, and `TLB: Use and match via TLBP`: the R bits) and the 64-bit address ones (`tlb64`).
 
 ### The PI's domain 2 and the cartridge's reads in hardware
 
@@ -1303,7 +1243,7 @@ registers, ~0.7 ALM per ALUT; some bring others with them):
 | `GB_CART` | -95 | -77 | | ~-65 |
 | `SI` | -48 | -43 | | ~-35 |
 | `PI2` | ~0 | -24 | | ~-20 |
-| `TLB_RAM` | ~0 | -57 | | ~-40 (4 M10K) |
+| `TLB_EN` (the real TLB with its micro-TLBs and the cached fetch: all of the CPU's TLB; `mips_core` alone, `quartus_map`) | -399 | -180 | | ~-280 (3 M10K) |
 | `MON` (and with it the MI, PI, VI, AI, SI) | -1,296 | -632 | -3 | ~-900 |
 
 `tools/area2/` has the scripts: `fit.sh <tag> <seed> [extra.qsf] [map]` (a snapshot of the tree plus the closing macros,

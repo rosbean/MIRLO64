@@ -14,15 +14,16 @@ u32 n64rt_tv = 1;                       /* osTvType: 1 NTSC until the ROM's regi
 
 /* the replaced functions, by N64RT_* index (n64rt_exc.S n64rt_dispatch) */
 #ifdef N64RT_OWN
-/* (the game's own libultra: three functions of the table only, the TLB's -- see below) */
-void n64rt_osMapTLB(void); void n64rt_osUnmapTLB(void); void n64rt_osUnmapTLBAll(void);
-void (*const n64rt_table[N64RT_NFUNCS])(void) = {
-    [N64RT_osMapTLB] = n64rt_osMapTLB, [N64RT_osUnmapTLB] = n64rt_osUnmapTLB, [N64RT_osUnmapTLBAll] = n64rt_osUnmapTLBAll,
-};
+/* (the game's own libultra: nothing of it is replaced, the TLB's functions neither -- the CPU has the real TLB) */
+void (*const n64rt_table[N64RT_NFUNCS])(void) = { 0 };
 #else
 #define N64RT_DECL(n) void n64rt_##n(void);
 N64RT_FUNCS(N64RT_DECL)
 #undef N64RT_DECL
+/* (the TLB's functions are the game's own: the CPU has the real TLB; their places in the table are empty) */
+#define N64RT_NONE(n) void n64rt_##n(void) __attribute__((weak));
+N64RT_TLB_FUNCS(N64RT_NONE)
+#undef N64RT_NONE
 #ifdef N64RT_SI_GAME                    /* (not in this runtime: their places in the table are empty) */
 #define N64RT_NONE(n) void n64rt_##n(void) __attribute__((weak));
 N64RT_SI_FUNCS(N64RT_NONE)
@@ -245,31 +246,9 @@ void n64rt_run(const n64rt_game_t *g)
     *rd32(BOOT_MEM_SIZE) = g->mem_size;
 
 #ifdef N64RT_OWN
-    /* The CPU's translation tables are the runtime's to fill (mips_core TLB_RAM): a game's Super Mario 64 maps its Goddard
-     * dynlists at 0x04000000 for the Mario head's screen, and a page it maps must be entered there. A core with the monitor
-     * (COP0 register 23's bit 0) takes the game's own tlbwi / tlbwr / tlbr / tlbp as a Reserved Instruction for the monitor
-     * level (n64rt_os.c, tlb_insn): nothing of the game is patched, no address of its libultra is needed, and code that
-     * the game loads or unpacks later is covered too. A core without that (an older bitstream) has the VR4300's TLB
-     * instructions do nothing; then osMapTLB, osUnmapTLB and osUnmapTLBAll, if the game's list has their addresses, are the
-     * runtime's: their first instruction becomes a reserved one (SPECIAL, function 0x35, the function's number in the code
-     * field), which the monitor level takes (a call to the runtime's code could not: an interrupt of the game's own arrives
-     * in it, at the runtime's vector) and does for the game (n64rt_os.c, own_tlb_call). */
-    {
-        u32 c23, done = 0;
-        __asm__ volatile("mfc0 %0, $23" : "=r"(c23));
-        if ((c23 & ~8u) == 0x54420001u) {
-            printf("n64rt: the game's own libultra, nothing of it replaced: its TLB instructions are the monitor's\n");
-        } else {
-            for (u32 i = 0; i < g->npatches; i++) {
-                const n64rt_patch_t *p = &g->patches[i];
-                if (p->func != N64RT_osMapTLB && p->func != N64RT_osUnmapTLB && p->func != N64RT_osUnmapTLBAll) continue;
-                *rd32(p->vram) = 0x00000035u | (p->func << 6);
-                done++;
-            }
-            printf("n64rt: the game's own libultra: nothing of it replaced but its TLB functions (%lu; this core does not take the TLB instructions)\n",
-                   (unsigned long)done);
-        }
-    }
+    /* The CPU has the real TLB (n64rt_tlbi_init stopped the runtime if it had not): the game's own tlbwi / tlbwr / tlbr / tlbp are
+     * the CPU's, a TLB exception is its own handler's, and nothing of its libultra is patched, no address of it is needed. */
+    printf("n64rt: the game's own libultra, nothing of it replaced\n");
     (void)s_names;
 #else
     /* each replaced function: lui t9, %hi(n64rt_dispatch) / jr t9 / ori t9, t9, index */

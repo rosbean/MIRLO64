@@ -1,45 +1,50 @@
-/* The fetch page registers (mips_core's FPG, with TLB_RAM; sim/mips_soc): code run from a mapped page whose entry in the fetch
- * table has its C bit set (COP0 23's bit 5) goes through the I-cache -- indexed by the virtual address, tagged by the physical
- * one that the page register gives -- instead of one uncached word at a time. Checked here:
- *   - the speed: a loop on a cacheable mapped page runs within 1.3x of the same loop in KSEG0; on a page without the C bit it
+/* Cached fetches from mapped pages (mips_core's FPG with the real TLB; sim/mips_soc): code run from a mapped page whose entry
+ * has a C field that is not 2 goes through the I-cache -- indexed by the virtual address, tagged by the physical one that the
+ * fetch micro-TLB's entry gives -- instead of one uncached word at a time. Checked here:
+ *   - the speed: a loop on a cacheable mapped page runs within 1.3x of the same loop in KSEG0; on a page with C = 2 it
  *     is still the slow path (and right);
- *   - more pages than the two registers, in turn: every result right;
+ *   - more pages than the two micro-TLB entries, in turn: every result right;
  *   - a page unmapped after it ran (the next fetch is the TLB's exception, though its lines are still in the cache), remapped
  *     to another frame (the new frame's code, not the old lines) and back;
  *   - the ASID: an entry of another ASID does not map the page, a global one does;
  *   - the same frame at several virtual colours (the cache's index bits above the page offset) and KSEG0: code rewritten and
  *     dropped by a hit-type cache op through any one of them is the new code through all of them;
  *   - a straight line of code across a page boundary, and a call between pages.
- * On a CPU without the page registers the same program passes but for the speed check (the mapped loop is far slower). */
-#include <stdint.h>
-#include <generated/csr.h>
-#include <system.h>
+ * The exceptions are the game's (a mapped pc): vectors in the RDRAM (tlbtest.h) that end in this program's trap_handler, which
+ * maps the faulting page as a game's refill handler does (tlbwr, or tlbp and tlbwi for an entry that is there but invalid).
+ * On a CPU without the cached fetches (COP0 23's bit 2) the same program passes but for the speed check. */
+#include "tlbtest.h"
 
-static void putc_(char c) { while (uart_txfull_read()); uart_rxtx_write((uint8_t)c); }
-static void puts_(const char *s) { while (*s) putc_(*s++); }
-static void puthex(uint32_t v) { for (int i = 28; i >= 0; i -= 4) putc_("0123456789abcdef"[(v >> i) & 15]); }
-static void putdec(uint32_t v) { char b[12]; int n = 0; do { b[n++] = (char)('0' + v % 10); v /= 10; } while (v); while (n) putc_(b[--n]); }
-static int fails;
-static void check(const char *what, uint32_t got, uint32_t want)
+enum { V = 1, D = 2, G = 4, C = 32 };
+/* the page table of the program: a pair's entry in the TLB at an index of its own, the pages as set */
+static struct { uint32_t va, asid, lo[2], g; int used; } sh[28];
+static uint32_t flags_lo(uint32_t pa, uint32_t flags)
 {
-    if (got == want) return;
-    fails++;
-    puts_("FAIL "); puts_(what); puts_(": got "); puthex(got); puts_(" want "); puthex(want); puts_("\n");
+    if (!(flags & V)) return 0;
+    return LOC(pa, (flags & C) ? 3u : 2u, LV | ((flags & D) ? LD : 0u));
 }
-
-#define MFC0(r) ({ uint32_t v_; __asm__ volatile("mfc0 %0, $" #r : "=r"(v_)); v_; })
-#define MTC0(r, v) __asm__ volatile("mtc0 %0, $" #r :: "r"((uint32_t)(v)))
-enum { V = 1, D = 2, G = 4, FETCH = 8, C = 32 };
-/* an entry for va's page: EntryHi has the page pair and the ASID */
+/* a page set (flags 0 and pa 0: unmapped) in the entry of its pair and ASID */
 static void tlb_set(uint32_t va, uint32_t asid, uint32_t pa, uint32_t flags)
 {
-    uint32_t hi = MFC0(10);
-    MTC0(10, (va & ~0x1FFFu) | asid);
-    MTC0(23, (pa & 0x1FFFF000u) | (va & 0x1000u ? 16u : 0u) | flags);
-    MTC0(10, hi);
+    uint32_t pv = va & ~0x1FFFu;
+    int i;
+    for (i = 0; i < 28 && sh[i].used; i++) if (sh[i].va == pv && sh[i].asid == asid) break;
+    if (i == 28) { puts_("FAIL tlb_set: no free entry\n"); fails++; return; }
+    if (!sh[i].used) { sh[i].used = 1; sh[i].va = pv; sh[i].asid = asid; sh[i].lo[0] = sh[i].lo[1] = 0; sh[i].g = 0; }
+    uint32_t hi0 = MFC0(10);
+    for (;;) {                                      /* (no other entry for the pair: the handler's, by tlbwr) */
+        uint32_t ix = tlb_probe(pv | asid);
+        if ((ix >> 31) || ix == (uint32_t)i) break;
+        tlb_wi(ix, 0, 0x80000000u + (ix << 13), 0, 0);
+    }
+    sh[i].lo[(va >> 12) & 1] = flags_lo(pa, flags);
+    if (flags & V) sh[i].g = (flags & G) ? LG : 0;
+    if (!sh[i].lo[0] && !sh[i].lo[1]) tlb_wi(i, 0, 0x80000000u + ((uint32_t)i << 13), 0, 0);
+    else tlb_wi(i, 0, pv | asid, sh[i].lo[0] | sh[i].g, sh[i].lo[1] | sh[i].g);
+    MTC0(10, hi0);
 }
-/* a fetch entry: valid and global; flags: C (cacheable) or 0 */
-static void code_page(uint32_t va, uint32_t pa, uint32_t flags) { tlb_set(va, 0, pa, V | G | FETCH | flags); }
+/* a fetch entry: valid and global; flags: C (cacheable) or 0 (uncached) */
+static void code_page(uint32_t va, uint32_t pa, uint32_t flags) { tlb_set(va, 0, pa, V | G | flags); }
 
 /* what the handler fills a faulting page with */
 static volatile uint32_t s_fill_pa, s_fill_flags;
@@ -48,13 +53,21 @@ void trap_handler(void)
 {
     s_traps++;
     s_cause = MFC0(13); s_badv = MFC0(8); s_epc = MFC0(14);
-    s_fetch = MFC0(23) >> 3 & 1;
-    MTC0(23, s_fill_pa | (s_badv & 0x1000u ? 16u : 0u) | s_fill_flags | (s_fetch ? FETCH : 0));
+    s_fetch = s_epc == s_badv;
+    uint32_t hi = MFC0(10);
+    uint32_t lo = flags_lo(s_fill_pa, s_fill_flags) | ((s_fill_flags & G) ? LG : 0u);
+    uint32_t ix = tlb_probe((s_badv & ~0x1FFFu) | (hi & 0xFF));
+    uint32_t lo0 = 0, lo1 = 0, pg = (s_badv >> 12) & 1;
+    if (!(ix >> 31)) {                              /* the entry is there (its other page kept) */
+        MTC0(0, ix); TLBR();
+        lo0 = MFC0(2); lo1 = MFC0(3);
+    }
+    if (pg) lo1 = lo; else lo0 = lo;
+    MTC0(5, 0); MTC0(10, (s_badv & ~0x1FFFu) | (hi & 0xFF)); MTC0(2, lo0); MTC0(3, lo1);
+    if (!(ix >> 31)) { MTC0(0, ix); TLBWI(); } else TLBWR();
 }
 #define CODE (s_cause >> 2 & 31)
 
-#define K0(pa) ((volatile uint32_t *)(0x80000000u | (pa)))
-#define K1(pa) ((volatile uint32_t *)(0xA0000000u | (pa)))
 typedef uint32_t (*fn_t)(uint32_t a);
 
 /* li v0, imm / jr ra / nop, written uncached into the frame at pa */
@@ -83,8 +96,11 @@ static void icache_hit_inval(uint32_t va) { __asm__ volatile(".set push\n.set mi
 int main(void)
 {
     puts_("tlbpg_test\n");
-    if ((MFC0(23) & ~9u) != 0x54420000u) { puts_("tlbpg_test: no tables in this CPU\n"); putc_(4); for (;;); }
-    for (uint32_t i = 0; i < 512; i++) { tlb_set(i << 12, 0, 0, 0); tlb_set(i << 12, 0, 0, FETCH); }
+    if (!has_real_tlb()) { puts_("tlbpg_test: no real TLB in this CPU\ntlbpg_test: FAILED\n"); putc_(4); for (;;); }
+    const int cached_fetch = (MFC0(23) & 4u) != 0;
+    tlb_unmap_all();
+    MTC0(6, 28);                                    /* Wired: the handler's tlbwr stays out of the program's entries */
+    install_game_vectors();
 
     /* ---- the plain case: a cacheable mapped page, run again and again ---- */
     mkfn(0x30000, 0x111);
@@ -103,8 +119,8 @@ int main(void)
     uint32_t t_unc = timed(0x0500B000u, 300);
     puts_("loop of 3000: KSEG0 "); putdec(t_k0); puts_(", mapped cacheable "); putdec(t_map);
     puts_("; loop of 300 uncached mapped "); putdec(t_unc); puts_(" (Count ticks)\n");
-    check("mapped cacheable loop within 1.3x of KSEG0's", t_map * 10 <= t_k0 * 13, 1);
-    check("uncached mapped: still the slow path", t_unc > t_k0 / 10 * 6, 1);
+    if (cached_fetch) check("mapped cacheable loop within 1.3x of KSEG0's", t_map * 10 <= t_k0 * 13, 1);
+    if (cached_fetch) check("uncached mapped: still the slow path", t_unc > t_k0 / 10 * 6, 1);
     check("speed: no trap", s_traps, 0);
 
     /* ---- more pages than registers, in turn ---- */
@@ -123,7 +139,7 @@ int main(void)
     code_page(0x07000000u, 0x50000, C);
     check("before", ((fn_t)0x07000000u)(0), 0x333);
     check("before again", ((fn_t)0x07000000u)(0), 0x333);
-    tlb_set(0x07000000u, 0, 0, FETCH);                               /* (invalid) */
+    tlb_set(0x07000000u, 0, 0, 0);                                   /* (invalid) */
     s_fill_pa = 0x52000; s_fill_flags = V | G | C;
     check("unmapped, the handler maps another frame", ((fn_t)0x07000000u)(0), 0x444);
     check("unmapped: trap", s_traps, 1);
@@ -142,21 +158,21 @@ int main(void)
     check("and back", ((fn_t)0x07000000u)(0), 0x333);
     check("remaps: no trap", s_traps, 1);
     /* an invalid entry again: the exception, the handler maps the first frame, the code runs */
-    tlb_set(0x07000000u, 0, 0, FETCH);
+    tlb_set(0x07000000u, 0, 0, 0);
     s_fill_pa = 0x50000; s_fill_flags = V | G | C;
     check("invalid again", ((fn_t)0x07000000u)(0), 0x333);
     check("invalid again: trap", s_traps, 2);
 
     /* ---- the ASID ---- */
     mkfn(0x54000, 0x555); mkfn(0x56000, 0x666);
-    tlb_set(0x08000000u, 5, 0x54000, V | C | FETCH);                 /* (not global) */
+    tlb_set(0x08000000u, 5, 0x54000, V | D | C);                     /* (not global) */
     MTC0(10, 5);
     uint32_t t0 = s_traps;
     check("asid 5", ((fn_t)0x08000000u)(0), 0x555);
     check("asid 5 again", ((fn_t)0x08000000u)(0), 0x555);
     check("asid 5: no trap", s_traps, t0);
     MTC0(10, 6);                                                     /* the register holds ASID 5's page: not this one's */
-    s_fill_pa = 0x56000; s_fill_flags = V | C;                       /* (filled for the ASID in EntryHi: 6) */
+    s_fill_pa = 0x56000; s_fill_flags = V | D | C;                   /* (filled for the ASID in EntryHi: 6) */
     check("asid 6", ((fn_t)0x08000000u)(0), 0x666);
     check("asid 6: trap", s_traps, t0 + 1);
     check("asid 6: code", CODE, 2);
@@ -165,14 +181,14 @@ int main(void)
     MTC0(10, 5);
     s_fill_pa = 0x54000;
     check("asid 5 again after 6", ((fn_t)0x08000000u)(0), 0x555);
-    check("asid 5 after 6: trap", s_traps, t0 + 2);
+    check("asid 5 after 6: no trap (its entry is still there)", s_traps, t0 + 1);
     MTC0(10, 0);
     /* a global entry maps the page for every ASID */
     code_page(0x08002000u, 0x54000, C);
     MTC0(10, 9); check("global, asid 9", ((fn_t)0x08002000u)(0), 0x555);
     MTC0(10, 3); check("global, asid 3", ((fn_t)0x08002000u)(0), 0x555);
     MTC0(10, 0);
-    check("global: no more traps", s_traps, t0 + 2);
+    check("global: no more traps", s_traps, t0 + 1);
 
     /* ---- one frame, several colours ---- */
     mkfn(0x34000, 0x700);
@@ -186,7 +202,7 @@ int main(void)
         icache_hit_inval(al[k]);
         for (int i = 0; i < 4; i++) check("alias, new code", ((fn_t)al[(i + k) & 3])(0), 0x710 + k);
     }
-    check("alias: no trap", s_traps, t0 + 2);
+    check("alias: no trap", s_traps, t0 + 1);
 
     /* ---- straight code across a page boundary, a call between pages ---- */
     {
@@ -236,8 +252,6 @@ int main(void)
         code_page(0x0F000000u, 0x6A000, C); code_page(0x0F001000u, 0x6C000, C); code_page(0x0F002000u, 0x6E000, C);
         check("three pages in a loop", ((fn_t)0x0F000000u)(300), 0);
     }
-    check("end: traps", s_traps, t0 + 2);
-    puts_(fails ? "tlbpg_test: FAILED\n" : "tlbpg_test: PASS\n");
-    putc_(4);
-    for (;;);
+    check("end: traps", s_traps, t0 + 1);
+    done("tlbpg_test");
 }

@@ -130,6 +130,7 @@ static void mem_before_edge()
     if (rq.busy) {
         if (rq.delay) { rq.delay--; return; }
         uint32_t a = rq.addr + 4 * (rq.words - rq.left), v = 0;
+        if (getenv("TB_MEMLOG") && (a >= 0x00800000u)) fprintf(stderr, "  [mem read %08x at cycle %" PRIu64 "]\n", a, cycles);
         if (n64_read_phys(&A, a, 4, &v)) {
             fprintf(stderr, "RTL read fault at %08x\n", a);
             A.halted = 1;

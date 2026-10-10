@@ -132,16 +132,12 @@ are shorter than before (the RSP's clock +0.36 / +0.55 ns).
   for). `lang/mips/test/rcpcpu_test.c` checks it all on the SoC; `sim/rsp/tb_dma` the DMA part on the RSP alone.
 * The RDP's XBUS reads (its commands taken from DMEM) are DMEM's second
   port (the banks' port B); the processor has port A.
-* The game CPU has no TLB of the VR4300's kind (`rtl/soc/mips_sys.sv`; the
-  macro `MIRLO_TLB` that put it in, ~550 ALMs, was removed). An N64 game's mapped addresses
-  are those below `0x2000_0000`, and the runtime keeps what the game maps
-  (`osMapTLB`). With `MIRLO_TLB_RAM` the CPU has translation tables in block
-  RAM that the runtime fills a page at a time, on the TLB's exception
-  ([mips.md](mips.md)); without it a load or store to a mapped page traps and
-  is done on the game's behalf (`n64rt_os.c`), which is for what a game maps
-  briefly -- Super Mario 64 maps `0x0400_0000` while it builds its title
-  screen's head (200,000 accesses, once) -- and code cannot run from a mapped
-  page.
+* The game CPU has the VR4300's own TLB (`rtl/soc/mips_sys.sv`, `mips_core`'s `TLB_EN`: 32 entries,
+  `tlbwi` / `tlbwr` / `tlbr` / `tlbp` and the TLB exceptions in the CPU; [mips.md](mips.md), "The TLB").
+  An N64 game's mapped addresses are those below `0x2000_0000` and `0x6000_0000` - `0x7FFF_FFFF`; nothing of
+  it is the runtime's (no table of the game's entries, no `osMapTLB` patch). Super Mario 64 maps `0x0400_0000`
+  while it builds its title screen's head, GoldenEye runs from a 4 MiB window at `0x7000_0000` and pages 4 KiB
+  pairs at `0x7F00_0000` from its own refill handler.
 * `lang/n64rt/n64rt_rsp.c` (a port built with `RSP=1`) starts a task as
   libultra's `osSpTaskLoad` does -- the header, its pointers physical, to
   DMEM `0xFC0` and the boot microcode to IMEM by DMA, PC 0, halt cleared --

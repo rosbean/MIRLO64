@@ -209,6 +209,30 @@ static void exc_stat_step()
     vb_was = t->vblank;
 }
 
+// TLBLOG=1: the game CPU's TLB, as it goes: its first TLB instructions and TLB exceptions with the CPU cycle (a clock of the game
+// CPU), the first fetch from 0x7F00_0000 and from 0x7000_0000, and every 10 M cycles the counts. Instrumentation only.
+static void tlb_log_step()
+{
+    static long cyc_cpu, ni[9], nx[4], printed, next = 10000000;
+    static bool f7f, f70;
+    cyc_cpu++;
+    if (t->tr_retire && (t->tr_insn & 0xFFFFFFC0u) == 0x42000000u) {
+        unsigned f = t->tr_insn & 63u; if (f == 1 || f == 2 || f == 6 || f == 8) ni[f]++;
+        if (printed++ < 24) printf("[tlb cpu cycle %ld pc %08x: %s]\n", cyc_cpu, t->tr_pc, f == 1 ? "tlbr" : f == 2 ? "tlbwi" : f == 6 ? "tlbwr" : f == 8 ? "tlbp" : "cop0");
+    }
+    if (t->tr_exc && t->tr_exc_code >= 1 && t->tr_exc_code <= 3) {
+        nx[t->tr_exc_code]++;
+        if (nx[1] + nx[2] + nx[3] <= 16) printf("[tlb cpu cycle %ld: exception %u at %08x]\n", cyc_cpu, t->tr_exc_code, t->tr_exc_pc);
+    }
+    if (t->tr_retire && !f7f && t->tr_pc >= 0x7F000000u && t->tr_pc < 0x7F100000u) { f7f = true; printf("[tlb cpu cycle %ld: first instruction retired from %08x]\n", cyc_cpu, t->tr_pc); }
+    if (t->tr_retire && !f70 && t->tr_pc >= 0x70000000u && t->tr_pc < 0x70800000u) { f70 = true; printf("[tlb cpu cycle %ld: first instruction retired from %08x]\n", cyc_cpu, t->tr_pc); }
+    if (cyc_cpu >= next) {
+        next += 10000000;
+        printf("[tlb %ld M cpu cycles: tlbwi %ld tlbwr %ld tlbr %ld tlbp %ld; exceptions Mod %ld TLBL %ld TLBS %ld]\n", cyc_cpu / 1000000, ni[2], ni[6], ni[1], ni[8], nx[1], nx[2], nx[3]);
+        fflush(stdout);
+    }
+}
+
 // CPUSTAT (see main): one cycle of the game CPU's clock
 static void cpu_stat_step(long sys)
 {
@@ -527,13 +551,14 @@ int main(int argc, char **argv)
     bool done = false;
     // the game CPU's clock: its edges every 2 x TB_CPU_M units, clk_sys2x's every TB_CPU_N
     long cpu_t = 0;                                 // its next edge
-    static const bool cstat = getenv("CPUSTAT") != nullptr, ctrace = getenv("CPUTRACE") != nullptr, excstat = getenv("EXCSTAT") != nullptr;
+    static const bool cstat = getenv("CPUSTAT") != nullptr, ctrace = getenv("CPUTRACE") != nullptr, excstat = getenv("EXCSTAT") != nullptr, tlblog = getenv("TLBLOG") != nullptr;
     auto cpu_to = [&](long now) {                   // its edges before `now`, each on its own; one at `now` with what follows
         for (; cpu_t <= now; cpu_t += 2 * TB_CPU_M) {
             bool rise = (cpu_t / (2 * TB_CPU_M)) % 2 == 0;
             if (rise && cstat) cpu_stat_step(sys);
             if (rise && ctrace) cpu_trace_step();
             if (rise && excstat) exc_stat_step();
+            if (rise && tlblog) tlb_log_step();
             t->clk_cpu = rise;
             if (cpu_t < now) t->eval();
         }
