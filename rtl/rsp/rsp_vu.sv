@@ -166,7 +166,21 @@ function automatic logic [15:0] mul_res(input logic [2:0] k, input logic [47:0] 
     return kc ? {c15, {15{clo}}} : klo ? a[15:0] : a[31:16];
 endfunction
 
-function automatic lane_t lane_ex(input logic [5:0] f, input logic [3:0] e, input logic [15:0] s, input logic [15:0] t,
+// what the lanes' adder does, by the instruction (kept with it, x_am: the adder is the start of EX's longest path):
+// 1 VADD, 2 VSUB, 3 VADDC, 4 VCH, 5 VCL, 6 VCR, 0 the rest (s - t)
+function automatic logic [2:0] amode(input logic [5:0] f);
+    unique case (f)
+    6'h10:   return 3'd1;
+    6'h11:   return 3'd2;
+    6'h14:   return 3'd3;
+    6'h25:   return 3'd4;
+    6'h24:   return 3'd5;
+    6'h26:   return 3'd6;
+    default: return 3'd0;
+    endcase
+endfunction
+
+function automatic lane_t lane_ex(input logic [5:0] f, input logic [2:0] am, input logic [3:0] e, input logic [15:0] s, input logic [15:0] t,
                                   input logic signed [33:0] p, input logic [15:0] vs, input logic [47:0] accm,
                                   input logic co_lo, input logic co_hi, input logic cc_lo, input logic cc_hi, input logic ce,
                                   input logic pre, input logic [3:0] fr);   // (pre: the adder's flags are fr, kept from the cycle before)
@@ -188,13 +202,13 @@ function automatic lane_t lane_ex(input logic [5:0] f, input logic [3:0] e, inpu
     logic        cin_x;
     nt = -t;
     sign = s[15] ^ t[15];
-    unique case (f)
-    6'h10:   begin sub = 1'b0;   cin = co_lo;  end          // VADD
-    6'h11:   begin sub = 1'b1;   cin = !co_lo; end          // VSUB
-    6'h14:   begin sub = 1'b0;   cin = 1'b0;   end          // VADDC
-    6'h25:   begin sub = !sign;  cin = !sign;  end          // VCH: s + t if the signs differ, else s - t
-    6'h24:   begin sub = !co_lo; cin = !co_lo; end          // VCL: the same, by VCO
-    6'h26:   begin sub = !sign;  cin = 1'b1;   end          // VCR: s + t + 1, or s - t
+    unique case (am)
+    3'd1:    begin sub = 1'b0;   cin = co_lo;  end          // VADD
+    3'd2:    begin sub = 1'b1;   cin = !co_lo; end          // VSUB
+    3'd3:    begin sub = 1'b0;   cin = 1'b0;   end          // VADDC
+    3'd4:    begin sub = !sign;  cin = !sign;  end          // VCH: s + t if the signs differ, else s - t
+    3'd5:    begin sub = !co_lo; cin = !co_lo; end          // VCL: the same, by VCO
+    3'd6:    begin sub = !sign;  cin = 1'b1;   end          // VCR: s + t + 1, or s - t
     default: begin sub = 1'b1;   cin = 1'b1;   end          // VSUBC, the compares
     endcase
     bb = sub ? ~t : t;
@@ -373,6 +387,7 @@ wire  fn_ch = fn == 6'h24 || fn == 6'h25 || fn == 6'h26;
 logic               b1;                       // (NP = 2) the second pass's SEL, this cycle
 logic [15:0]        s_hi [LANES], t_hi [LANES];
 logic [5:0]         x_fn;
+logic [2:0]         x_am;                     // (amode of it)
 wire  [5:0]         fn_m  = (NP == 2 && b1) ? x_fn : fn;
 wire  s_sgn = fn_m[2:0] == 3'd0 || fn_m[2:0] == 3'd1 || fn_m[2:0] == 3'd5 || fn_m[2:0] == 3'd7;
 wire  t_sgn = fn_m[2:0] == 3'd0 || fn_m[2:0] == 3'd1 || fn_m[2:0] == 3'd6 || fn_m[2:0] == 3'd7;
@@ -423,7 +438,7 @@ always_comb
         3'd6:    vs = acc_l[(LANES + l) & 7];
         default: vs = 'x;
         endcase
-        ex[l] = lane_ex(x_fn, x_ve, s_r[l], t_r[l], p_r[l], vs, {acc_h[lm], acc_m[lm], acc_l[lm]},
+        ex[l] = lane_ex(x_fn, x_am, x_ve, s_r[l], t_r[l], p_r[l], vs, {acc_h[lm], acc_m[lm], acc_l[lm]},
                         vco[li], vco[4'd8 + li], vcc[li], vcc[4'd8 + li], vce[li], x_pre, fl_r[l]);
     end
 lane_t exm [LANES];
@@ -741,7 +756,7 @@ always_ff @(posedge clk) begin
             x_wait <= NP == 1 ? ((fn_rcp && fn[1:0] != 2'd2) || fn_ch)
                               : (sel1 && lw_nx && x_one);       // (a write of one lane is not kept: it waits)
             if (sel0) begin
-                x_fn <= fn; x_ve <= ve; x_vdn <= vdn; x_de <= de; x_one <= fn_one; x_rcp <= fn_rcp;
+                x_fn <= fn; x_am <= amode(fn); x_ve <= ve; x_vdn <= vdn; x_de <= de; x_one <= fn_one; x_rcp <= fn_rcp;
                 x_pre <= NP == 1 && fn_ch;
                 for (int l = 0; l < LANES; l++) begin         // (two passes) the second's operands
                     s_hi[l] <= qa[((LANES + l) & 7)]; t_hi[l] <= tv[((LANES + l) & 7)];
