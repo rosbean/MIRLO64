@@ -58,11 +58,13 @@ function automatic logic [IW:0] ring(input logic [N-1:0] v, input logic [IW-1:0]
 endfunction
 // the next port: cur if held and still asking, else urgent first, else round-robin after cur
 logic [IW-1:0] pick, pu, pn;
-logic          any, fu, fn;
+logic          any, fu;
+logic [IW:0]   rn;
 always_comb begin
     any = |p_valid;
     {fu, pu} = ring(p_valid & p_urgent, cur);
-    {fn, pn} = ring(p_valid, cur);
+    rn = ring(p_valid, cur);
+    pn = rn[IW-1:0];
     if (held && p_valid[cur] && beats < 5'(MAXB)) pick = cur;
     else pick = fu ? pu : pn;
 end
