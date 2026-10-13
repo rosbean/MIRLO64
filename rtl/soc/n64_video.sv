@@ -242,6 +242,8 @@ wire  [5:0]  tq_n = 6'(tq_w - tq_r);
 wire  [4:0]  tq_h = tq[tq_r];
 wire  [3:0]  h_nib = hreg[{tq_h[2:0], 2'b00} +: 4];
 wire         m_hid = h_next;
+// (the next read's address in its row: one adder -- a pair's B word a row of the picture on, its next A word back, else the next word)
+wire  [23:0] raddr_n = raddr + ((avg_f && !bsel) ? PROW : avg_f ? PBACK : 24'd1);
 always_ff @(posedge clk) begin
     if (rst) begin epoch_sys <= 0; running <= 0; issued <= 0; got <= 0; drop <= 0;
                    col <= 0; raddr <= 0; all <= 1; tv_pal <= 0; h_next <= 0; end
@@ -272,12 +274,12 @@ always_ff @(posedge clk) begin
                 issued <= issued + 10'd1;
                 rs_next <= 1'b0;
                 bsel <= 1'b1;
-                raddr <= raddr + PROW;
+                raddr <= raddr_n;
             end else if (m_valid && m_ready) begin
                 issued <= issued + 10'd1;
                 rs_next <= 1'b0;
                 bsel <= 1'b0;
-                raddr <= raddr + (avg_f ? PBACK : 24'd1);
+                raddr <= raddr_n;
                 if (col == nw_f - 11'd1) begin            // a row's last word: the next row
                     col <= 0;
                     raddr <= rowp_n; rowp <= rowp_n; yacc <= yan[9:0];
